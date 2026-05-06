@@ -130,8 +130,9 @@ impl MessageDecrypter for WCTls12Decrypter {
         }
 
         let mut nonce = [0u8; GCM_NONCE_LENGTH];
-        nonce[..(GCM_NONCE_LENGTH - 8)].copy_from_slice(self.implicit_iv.as_ref());
-        nonce[(GCM_NONCE_LENGTH - 8)..].copy_from_slice(&payload[..(GCM_NONCE_LENGTH - 4)]);
+        // RFC 5288: nonce = fixed_iv (4 bytes) || explicit_nonce (8 bytes from wire).
+        nonce[..(GCM_NONCE_LENGTH - 8)].copy_from_slice(self.implicit_iv.as_ref()); // fixed_iv
+        nonce[(GCM_NONCE_LENGTH - 8)..].copy_from_slice(&payload[..(GCM_NONCE_LENGTH - 4)]); // explicit
 
         let mut auth_tag = [0u8; GCM_TAG_LENGTH];
         auth_tag.copy_from_slice(&payload[payload_len - GCM_TAG_LENGTH..]);

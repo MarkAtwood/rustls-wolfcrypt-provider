@@ -129,9 +129,13 @@ impl MessageDecrypter for WCTls12Decrypter {
             return Err(rustls::Error::DecryptError);
         }
 
+        // RFC 5288 TLS 1.2 AES-GCM nonce: fixed_iv (4 bytes) || explicit_nonce (8 bytes).
+        // fixed_iv is the implicit IV from the key block; explicit_nonce is the first 8
+        // bytes of the on-wire payload. The constant expressions (GCM_NONCE_LENGTH - 8) = 4
+        // and (GCM_NONCE_LENGTH - 4) = 8 represent fixed_iv_len and explicit_nonce_len.
         let mut nonce = [0u8; GCM_NONCE_LENGTH];
-        nonce[..(GCM_NONCE_LENGTH - 8)].copy_from_slice(self.implicit_iv.as_ref());
-        nonce[(GCM_NONCE_LENGTH - 8)..].copy_from_slice(&payload[..(GCM_NONCE_LENGTH - 4)]);
+        nonce[..(GCM_NONCE_LENGTH - 8)].copy_from_slice(self.implicit_iv.as_ref()); // fixed_iv
+        nonce[(GCM_NONCE_LENGTH - 8)..].copy_from_slice(&payload[..(GCM_NONCE_LENGTH - 4)]); // explicit
 
         let mut auth_tag = [0u8; GCM_TAG_LENGTH];
         auth_tag.copy_from_slice(&payload[payload_len - GCM_TAG_LENGTH..]);

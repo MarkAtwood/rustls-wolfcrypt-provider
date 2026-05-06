@@ -3,6 +3,8 @@ use rustls_pki_types::alg_id;
 use wolfssl_wolfcrypt::rsa::RSA;
 use wolfssl_wolfcrypt::sha::{SHA256, SHA384, SHA512};
 
+// Output buffer for wc_RsaPSS_VerifyCheck. 512 bytes = 4096-bit RSA key maximum.
+// Keys larger than 4096 bits will cause VerifyCheck to return BUFFER_E (InvalidSignature).
 const RSA_PSS_OUT_SIZE: usize = 512;
 
 #[derive(Debug)]

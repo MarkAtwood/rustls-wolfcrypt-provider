@@ -219,7 +219,11 @@ impl Signer for RsaSigner {
                 }
             }
 
-            // RSA-PKCS#1 v1.5: dispatch on runtime key size (256/384/512 bytes).
+            // RSA-PKCS#1 v1.5: wc_SignatureGenerate (called by pkcs1_sign_with_size via
+            // rsa_pkcs1v15::SigningKey::try_sign) hashes the raw message internally.
+            // This is intentionally asymmetric with RSA-PSS above, which pre-hashes
+            // externally before calling pss_sign. Do NOT change PKCS#1 to pre-hash:
+            // wc_SignatureGenerate performs DigestInfo encoding as part of PKCS#1 v1.5.
             SignatureScheme::RSA_PKCS1_SHA256 => {
                 pkcs1_sign_with_size::<Sha256, 256>(der, message)
                     .or_else(|_| pkcs1_sign_with_size::<Sha256, 384>(der, message))

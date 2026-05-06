@@ -46,6 +46,10 @@ tokio = { version = "1.43", features = ["macros", "rt", "net", "io-util", "io-st
 webpki-roots = { version = "0.26", default-features = false }
 rustls = { version = "0.23.22", features = ["std", "tls12"] }
 rustls-pemfile = { version = "2.2.0", default-features = false, features = ["std"]}
+der = { version = "0.7", features = ["alloc"] }
+pkcs1 = { version = "0.7", default-features = false, features = ["alloc", "pkcs8"] }
+pkcs8 = { version = "0.10", features = ["alloc"] }
+sec1 = { version = "0.7", default-features = false, features = ["alloc", "der"] }
 
 [features]
 default = []

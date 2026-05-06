@@ -64,10 +64,8 @@ impl KeyExchangeSecP521r1 {
         )
         .map_err(|_| rustls::Error::General("Failed to import ECC private key".into()))?;
 
-        // Import peer public key from raw X/Y components (skip the 0x04 prefix).
-        let qx = &peer_pub_key[1..1 + COORD_SIZE];
-        let qy = &peer_pub_key[1 + COORD_SIZE..PUB_KEY_SIZE];
-        let mut pub_key = ECC::import_unsigned(qx, qy, &[], ECC::SECP521R1, None, None)
+        // Import peer public key from uncompressed X9.63 point (0x04 || X || Y).
+        let mut pub_key = ECC::import_x963(peer_pub_key, None, None)
             .map_err(|_| rustls::Error::General("Failed to import peer ECC public key".into()))?;
 
         priv_key

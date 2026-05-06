@@ -98,8 +98,8 @@ impl rustls::crypto::KeyProvider for Provider {
 
         for algorithm in algorithms {
             match algorithm(&key_der) {
-                Ok(signing_key) => return Ok(signing_key), // Return the key if the algorithm succeeds
-                Err(_) => continue, // Ignore the error and move to the next algorithm
+                Ok(signing_key) => return Ok(signing_key),
+                Err(_) => continue,
             }
         }
 

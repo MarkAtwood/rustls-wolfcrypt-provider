@@ -4,15 +4,16 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use pkcs8::PrivateKeyInfo;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::sign::{Signer, SigningKey};
 use rustls::{SignatureAlgorithm, SignatureScheme};
+use signature::SignerMut;
 use wolfssl_wolfcrypt::ecc::ECC;
 use wolfssl_wolfcrypt::ecdsa::{
     P256SigningKey, P256Signature, P384SigningKey, P384Signature, P521SigningKey, P521Signature,
 };
 use wolfssl_wolfcrypt::random::RNG;
-use signature::SignerMut;
 use zeroize::Zeroizing;
 
 /// A unified ECDSA signing key that supports P-256, P-384, P-521.
@@ -61,18 +62,25 @@ impl TryFrom<&PrivateKeyDer<'_>> for EcdsaSigningKey {
     type Error = rustls::Error;
 
     fn try_from(value: &PrivateKeyDer<'_>) -> Result<Self, Self::Error> {
-        let der = match value {
+        // Extract the SEC1 ECPrivateKey bytes regardless of outer wrapper.
+        // ECC::import_der calls wc_EccPrivateKeyDecode which handles SEC1 format.
+        // For PKCS8 input, unwrap to SEC1 first so we pass a known format.
+        let sec1_bytes: &[u8] = match value {
             PrivateKeyDer::Pkcs8(der) => {
                 let raw = der.secret_pkcs8_der();
-                // Guard: wc_EccPrivateKeyDecode crashes on Ed25519/Ed448 PKCS#8 input
-                // in wolfssl 5.9.1 due to partial key initialization followed by
-                // wc_ecc_free failing. Reject these key types early.
+                // Guard: reject Ed25519/Ed448 PKCS8 early — they crash wc_EccPrivateKeyDecode.
                 if is_eddsa_pkcs8(raw) {
                     return Err(rustls::Error::General(
                         "Unsupported ECDSA key format (EdDSA key)".into(),
                     ));
                 }
-                raw
+                // Unwrap the PKCS8 outer layer to get the SEC1 ECPrivateKey DER.
+                // pkcs8::PrivateKeyInfo::try_from parses the AlgorithmIdentifier and
+                // returns private_key as the inner OCTET STRING value.
+                // For id-ecPublicKey keys that inner value is the SEC1 ECPrivateKey DER.
+                PrivateKeyInfo::try_from(raw)
+                    .map(|pki| pki.private_key)
+                    .unwrap_or(raw) // fall back to raw if PKCS8 parse fails
             }
             PrivateKeyDer::Sec1(der) => der.secret_sec1_der(),
             PrivateKeyDer::Pkcs1(_) => {
@@ -87,9 +95,15 @@ impl TryFrom<&PrivateKeyDer<'_>> for EcdsaSigningKey {
             }
         };
 
-        // Import the DER-encoded private key (handles both PKCS#8 and SEC1).
-        let mut ecc = ECC::import_der(der, None, None)
-            .map_err(|_| rustls::Error::General("ECC::import_der failed".into()))?;
+        // Import the SEC1 ECPrivateKey DER.
+        let mut ecc = ECC::import_der(sec1_bytes, None, None)
+            .map_err(|e| rustls::Error::General(alloc::format!("ECC::import_der failed: {}", e).into()))?;
+
+        // wc_EccPrivateKeyDecode does not always compute the public key automatically
+        // when the SEC1 structure omits the optional [1] PUBLIC KEY field.
+        // Call make_pub to derive the public key from the private scalar.
+        ecc.make_pub(None)
+            .map_err(|e| rustls::Error::General(alloc::format!("ECC::make_pub failed: {}", e).into()))?;
 
         // Export the x963 public key to determine the curve.
         // Max x963 size for any supported curve is 133 bytes (P-521).
@@ -230,3 +244,77 @@ impl Signer for EcdsaSigningKey {
 
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wolfssl_wolfcrypt::ecc::ECC;
+    use wolfssl_wolfcrypt::random::RNG;
+
+    #[test]
+    fn test_ecdsa_import_and_sign() {
+        // Generate a P-256 key via the wrapper, then sign with it directly.
+        let mut rng = RNG::new().expect("rng");
+        let curve_size = ECC::get_curve_size_from_id(ECC::SECP256R1).expect("curve_size");
+        let mut key = ECC::generate_ex(curve_size, &mut rng, ECC::SECP256R1, None, None).expect("generate");
+
+        // Export private scalar
+        let mut priv_buf = [0u8; 32];
+        key.export_private(&mut priv_buf).expect("export_private");
+
+        // Export x963 public key
+        let mut x963 = [0u8; 65];
+        let x963_len = key.export_x963(&mut x963).expect("export_x963");
+        assert_eq!(x963_len, 65);
+
+        // Build a P256SigningKey and sign
+        let rng2 = RNG::new().expect("rng2");
+        let mut sk = P256SigningKey::import_x963(&x963, &priv_buf, rng2)
+            .expect("P256SigningKey::import_x963");
+        let sig: P256Signature = sk.try_sign(b"hello world").expect("try_sign");
+        assert_eq!(sig.to_bytes().len(), 64);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use rustls::pki_types::{PrivateSec1KeyDer, PrivatePkcs8KeyDer};
+    use wolfcrypt_rs::*;
+    use core::mem;
+    use crate::types::*;
+    use foreign_types::ForeignType;
+
+    #[test]
+    fn test_ecdsa_try_from_sec1_wolfcrypt_rs() {
+        // Generate P-256 key via wolfcrypt-rs, same as the e2e test does
+        let mut rng: WC_RNG = unsafe { mem::zeroed() };
+        let rng_object = WCRngObject::new(&mut rng);
+        rng_object.init();
+        let mut ecc_key_c_type: ecc_key = unsafe { mem::zeroed() };
+        let key_object = ECCKeyObject::new(&mut ecc_key_c_type);
+        key_object.init();
+
+        let ret = unsafe {
+            wc_ecc_make_key_ex(rng_object.as_ptr(), 32, key_object.as_ptr(), ecc_curve_id_ECC_SECP256R1)
+        };
+        assert_eq!(ret, 0, "wc_ecc_make_key_ex failed: {}", ret);
+
+        let mut der_buf = vec![0u8; 200];
+        let ret = unsafe {
+            wc_EccPrivateKeyToDer(key_object.as_ptr(), der_buf.as_mut_ptr(), der_buf.len() as u32)
+        };
+        assert!(ret > 0, "wc_EccPrivateKeyToDer failed: {}", ret);
+        der_buf.resize(ret as usize, 0);
+
+        // Try loading as SEC1 key
+        let sec1_key = PrivateKeyDer::from(PrivateSec1KeyDer::from(der_buf.as_slice()));
+        let result = EcdsaSigningKey::try_from(&sec1_key);
+        assert!(result.is_ok(), "SEC1 try_from failed: {:?}", result.err());
+
+        // Try loading as PKCS8-labeled (but SEC1 content)
+        let pkcs8_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(der_buf.as_slice()));
+        let result2 = EcdsaSigningKey::try_from(&pkcs8_key);
+        assert!(result2.is_ok(), "PKCS8-wrapped-SEC1 try_from failed: {:?}", result2.err());
+    }
+}

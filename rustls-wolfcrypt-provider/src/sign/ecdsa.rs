@@ -1,31 +1,32 @@
 use crate::alloc::string::ToString;
-use crate::error::*;
-use crate::types::*;
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
-use core::mem;
-use core::ptr;
-use foreign_types::ForeignType;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::sign::{Signer, SigningKey};
 use rustls::{SignatureAlgorithm, SignatureScheme};
-
-use wolfcrypt_rs::*;
+use wolfssl_wolfcrypt::ecc::ECC;
+use wolfssl_wolfcrypt::ecdsa::{
+    P256SigningKey, P256Signature, P384SigningKey, P384Signature, P521SigningKey, P521Signature,
+};
+use wolfssl_wolfcrypt::random::RNG;
+use signature::SignerMut;
 use zeroize::Zeroizing;
 
 /// A unified ECDSA signing key that supports P-256, P-384, P-521.
-/// Internally, we store the raw private key bytes plus
-/// which scheme we should use (determined by WolfSSL after decode).
+///
+/// Stores the raw private scalar bytes and the x963-encoded public key bytes
+/// so that a per-curve signing key can be reconstructed on each `sign()` call
+/// without retaining unsafe state across threads.
 #[derive(Clone)]
 pub struct EcdsaSigningKey {
-    /// Raw private key bytes exported from WolfSSL (`wc_ecc_export_private_only`)
-    /// in big-endian format.
-    key: Arc<Zeroizing<Vec<u8>>>,
-    /// The signature scheme to use (e.g. ECDSA_NISTP256_SHA256).
+    /// Raw private scalar `d` (big-endian), exactly field_size bytes.
+    priv_key: Arc<Zeroizing<Vec<u8>>>,
+    /// Uncompressed X9.63 public key (0x04 || x || y).
+    pub_x963: Arc<Vec<u8>>,
+    /// The signature scheme (determines curve and hash).
     scheme: SignatureScheme,
 }
 
@@ -41,7 +42,7 @@ impl TryFrom<&PrivateKeyDer<'_>> for EcdsaSigningKey {
     type Error = rustls::Error;
 
     fn try_from(value: &PrivateKeyDer<'_>) -> Result<Self, Self::Error> {
-        let der_formatted = match value {
+        let der = match value {
             PrivateKeyDer::Pkcs8(der) => der.secret_pkcs8_der(),
             PrivateKeyDer::Sec1(der) => der.secret_sec1_der(),
             PrivateKeyDer::Pkcs1(_) => {
@@ -51,73 +52,54 @@ impl TryFrom<&PrivateKeyDer<'_>> for EcdsaSigningKey {
             }
             _ => {
                 return Err(rustls::Error::General(
-                    "Unsupported ECDSA key format (not PKCS#8)".into(),
+                    "Unsupported ECDSA key format".into(),
                 ))
             }
         };
 
-        let mut ecc_c_type: ecc_key = unsafe { mem::zeroed() };
-        let ecc_key_object = ECCKeyObject::new(&mut ecc_c_type);
+        // Import the DER-encoded private key (handles both PKCS#8 and SEC1).
+        let mut ecc = ECC::import_der(der, None, None)
+            .map_err(|_| rustls::Error::General("ECC::import_der failed".into()))?;
 
-        ecc_key_object.init();
+        // Export the x963 public key to determine the curve.
+        // Max x963 size for any supported curve is 133 bytes (P-521).
+        let mut x963_buf = [0u8; 133];
+        let x963_len = ecc
+            .export_x963(&mut x963_buf)
+            .map_err(|_| rustls::Error::General("export_x963 failed".into()))?;
+        let pub_x963 = x963_buf[..x963_len].to_vec();
 
-        let mut idx: u32 = 0;
-        let ret = unsafe {
-            wc_EccPrivateKeyDecode(
-                der_formatted.as_ptr() as *mut u8,
-                &mut idx,
-                ecc_key_object.as_ptr(),
-                der_formatted.len() as word32,
-            )
-        };
-        check_if_zero(ret)
-            .map_err(|_| rustls::Error::General("wc_EccPrivateKeyDecode failed".into()))?;
+        // Determine scheme from x963 length: 65 -> P-256, 97 -> P-384, 133 -> P-521.
+        let scheme = x963_len_to_scheme(x963_len)
+            .map_err(|e| rustls::Error::General(e.to_string()))?;
 
-        let key_size = unsafe { wc_ecc_size(ecc_key_object.as_ptr()) };
-        if key_size == 0 {
-            return Err(rustls::Error::General(
-                "wc_ecc_size returned 0; invalid key?".into(),
-            ));
-        }
-
-        let mut priv_key_bytes = vec![0u8; key_size as usize];
-        let mut priv_key_bytes_len = priv_key_bytes.len() as word32;
-
-        let ret = unsafe {
-            wc_ecc_export_private_only(
-                ecc_key_object.as_ptr(),
-                priv_key_bytes.as_mut_ptr(),
-                &mut priv_key_bytes_len,
-            )
-        };
-        check_if_zero(ret)
-            .map_err(|_| rustls::Error::General("wc_ecc_export_private_only failed".into()))?;
-
-        priv_key_bytes.truncate(priv_key_bytes_len as usize);
-
-        let scheme =
-            curve_id_to_scheme(key_size).map_err(|e| rustls::Error::General(e.to_string()))?;
+        let field_size = (x963_len - 1) / 2;
+        let mut priv_buf = vec![0u8; field_size];
+        let priv_len = ecc
+            .export_private(&mut priv_buf)
+            .map_err(|_| rustls::Error::General("export_private failed".into()))?;
+        priv_buf.truncate(priv_len);
 
         Ok(Self {
-            key: Arc::new(Zeroizing::new(priv_key_bytes)),
+            priv_key: Arc::new(Zeroizing::new(priv_buf)),
+            pub_x963: Arc::new(pub_x963),
             scheme,
         })
     }
 }
 
-/// Converts a key size to a `SignatureScheme` (e.g. 32 -> ECDSA_NISTP256_SHA256).
-fn curve_id_to_scheme(key_size: i32) -> Result<SignatureScheme, &'static str> {
-    match key_size {
-        32 => Ok(SignatureScheme::ECDSA_NISTP256_SHA256),
-        48 => Ok(SignatureScheme::ECDSA_NISTP384_SHA384),
-        66 => Ok(SignatureScheme::ECDSA_NISTP521_SHA512),
-        _ => Err("Unsupported ECC key size"),
+/// Map x963 public key length to rustls `SignatureScheme`.
+fn x963_len_to_scheme(x963_len: usize) -> Result<SignatureScheme, &'static str> {
+    match x963_len {
+        65 => Ok(SignatureScheme::ECDSA_NISTP256_SHA256),
+        97 => Ok(SignatureScheme::ECDSA_NISTP384_SHA384),
+        133 => Ok(SignatureScheme::ECDSA_NISTP521_SHA512),
+        _ => Err("Unsupported ECDSA curve (unrecognised x963 key length)"),
     }
 }
 
 impl SigningKey for EcdsaSigningKey {
     fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
-        // If the server (or peer) offered the scheme we have, we can sign with it
         if offered.contains(&self.scheme) {
             Some(Box::new(self.clone()))
         } else {
@@ -132,123 +114,85 @@ impl SigningKey for EcdsaSigningKey {
 
 impl Signer for EcdsaSigningKey {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
-        let digest = hash_message_for_scheme(self.scheme, message)
-            .map_err(|_| rustls::Error::General("hash failed".into()))?;
+        let rng = RNG::new()
+            .map_err(|_| rustls::Error::General("RNG::new failed".into()))?;
 
-        let mut rng: WC_RNG = unsafe { mem::zeroed() };
-        let rng_object: WCRngObject = WCRngObject::new(&mut rng);
-        rng_object.init();
-
-        let mut ecc_c_type: ecc_key = unsafe { mem::zeroed() };
-        let ecc_key_object = ECCKeyObject::new(&mut ecc_c_type);
-        ecc_key_object.init();
-
-        let curve_id = scheme_to_curve_id(self.scheme)
-            .map_err(|e| rustls::Error::General(format!("scheme_to_curve_id unsupported: {e}")))?;
-
-        let ret = unsafe {
-            wc_ecc_import_private_key_ex(
-                self.key.as_ptr(),
-                self.key.len() as word32,
-                ptr::null_mut(),
-                0,
-                ecc_key_object.as_ptr(),
-                curve_id,
-            )
+        // Build a DER-encoded ECDSA signature from the r||s bytes the wrapper
+        // returns, because that is what TLS expects.
+        let rs_bytes = match self.scheme {
+            SignatureScheme::ECDSA_NISTP256_SHA256 => {
+                let pub_arr: [u8; 65] = self
+                    .pub_x963
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| rustls::Error::General("pub_x963 length mismatch".into()))?;
+                let d_arr: [u8; 32] = self
+                    .priv_key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| rustls::Error::General("priv_key length mismatch".into()))?;
+                let mut sk = P256SigningKey::import_x963(&pub_arr, &d_arr, rng)
+                    .map_err(|_| rustls::Error::General("P256SigningKey::import_x963 failed".into()))?;
+                let sig: P256Signature = sk
+                    .try_sign(message)
+                    .map_err(|_| rustls::Error::General("P256 sign failed".into()))?;
+                sig.to_bytes().to_vec()
+            }
+            SignatureScheme::ECDSA_NISTP384_SHA384 => {
+                let pub_arr: [u8; 97] = self
+                    .pub_x963
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| rustls::Error::General("pub_x963 length mismatch".into()))?;
+                let d_arr: [u8; 48] = self
+                    .priv_key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| rustls::Error::General("priv_key length mismatch".into()))?;
+                let mut sk = P384SigningKey::import_x963(&pub_arr, &d_arr, rng)
+                    .map_err(|_| rustls::Error::General("P384SigningKey::import_x963 failed".into()))?;
+                let sig: P384Signature = sk
+                    .try_sign(message)
+                    .map_err(|_| rustls::Error::General("P384 sign failed".into()))?;
+                sig.to_bytes().to_vec()
+            }
+            SignatureScheme::ECDSA_NISTP521_SHA512 => {
+                let pub_arr: [u8; 133] = self
+                    .pub_x963
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| rustls::Error::General("pub_x963 length mismatch".into()))?;
+                let d_arr: [u8; 66] = self
+                    .priv_key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| rustls::Error::General("priv_key length mismatch".into()))?;
+                let mut sk = P521SigningKey::import_x963(&pub_arr, &d_arr, rng)
+                    .map_err(|_| rustls::Error::General("P521SigningKey::import_x963 failed".into()))?;
+                let sig: P521Signature = sk
+                    .try_sign(message)
+                    .map_err(|_| rustls::Error::General("P521 sign failed".into()))?;
+                sig.to_bytes().to_vec()
+            }
+            _ => {
+                return Err(rustls::Error::General(
+                    "Unsupported ECDSA scheme".into(),
+                ))
+            }
         };
-        check_if_zero(ret)
-            .map_err(|_| rustls::Error::General("wc_ecc_import_private_key_ex failed".into()))?;
 
-        let ret =
-            unsafe { wc_ecc_set_curve(ecc_key_object.as_ptr(), self.key.len() as i32, curve_id) };
-        check_if_zero(ret).map_err(|_| rustls::Error::General("wc_ecc_set_curve failed".into()))?;
-
-        let mut sig = [0u8; ECC_MAX_SIG_SIZE as usize];
-        let mut sig_sz: word32 = sig.len() as word32;
-
-        let ret = unsafe {
-            wc_ecc_sign_hash(
-                digest.as_ptr() as *mut u8,
-                digest.len() as word32,
-                sig.as_mut_ptr(),
-                &mut sig_sz,
-                rng_object.as_ptr(),
-                ecc_key_object.as_ptr(),
-            )
-        };
-        check_if_zero(ret).map_err(|_| rustls::Error::General("wc_ecc_sign_hash failed".into()))?;
-
-        // truncate to actual sig size
-        let mut sig_vec = sig.to_vec();
-        sig_vec.truncate(sig_sz as usize);
-
-        Ok(sig_vec)
+        // The wrapper produces fixed r||s bytes; convert to DER for TLS.
+        let field_size = rs_bytes.len() / 2;
+        let (r, s) = rs_bytes.split_at(field_size);
+        // Max DER size for any supported curve is 141 bytes (P-521).
+        let mut der_buf = vec![0u8; 141];
+        let der_len = ECC::rs_bin_to_sig(r, s, &mut der_buf)
+            .map_err(|_| rustls::Error::General("rs_bin_to_sig failed".into()))?;
+        der_buf.truncate(der_len);
+        Ok(der_buf)
     }
 
     fn scheme(&self) -> SignatureScheme {
         self.scheme
-    }
-}
-
-/// Hash the input `message` according to the scheme’s hash algorithm.
-/// Returns the raw digest bytes.
-fn hash_message_for_scheme(
-    scheme: SignatureScheme,
-    message: &[u8],
-) -> Result<Vec<u8>, &'static str> {
-    match scheme {
-        SignatureScheme::ECDSA_NISTP256_SHA256 => {
-            let mut digest = vec![0u8; WC_SHA256_DIGEST_SIZE as usize];
-            let ret = unsafe {
-                wc_Sha256Hash(
-                    message.as_ptr(),
-                    message.len() as word32,
-                    digest.as_mut_ptr(),
-                )
-            };
-            if ret != 0 {
-                return Err("wc_Sha256Hash failed");
-            }
-            Ok(digest)
-        }
-        SignatureScheme::ECDSA_NISTP384_SHA384 => {
-            let mut digest = vec![0u8; WC_SHA384_DIGEST_SIZE as usize];
-            let ret = unsafe {
-                wc_Sha384Hash(
-                    message.as_ptr(),
-                    message.len() as word32,
-                    digest.as_mut_ptr(),
-                )
-            };
-            if ret != 0 {
-                return Err("wc_Sha384Hash failed");
-            }
-            Ok(digest)
-        }
-        SignatureScheme::ECDSA_NISTP521_SHA512 => {
-            let mut digest = vec![0u8; WC_SHA512_DIGEST_SIZE as usize];
-            let ret = unsafe {
-                wc_Sha512Hash(
-                    message.as_ptr(),
-                    message.len() as word32,
-                    digest.as_mut_ptr(),
-                )
-            };
-            if ret != 0 {
-                return Err("wc_Sha512Hash failed");
-            }
-            Ok(digest)
-        }
-        _ => Err("Unsupported scheme for ECDSA signing"),
-    }
-}
-
-/// Converts a rustls `SignatureScheme` to the WolfSSL curve id (ecc_curve_id_ECC_...).
-fn scheme_to_curve_id(scheme: SignatureScheme) -> Result<i32, &'static str> {
-    match scheme {
-        SignatureScheme::ECDSA_NISTP256_SHA256 => Ok(ecc_curve_id_ECC_SECP256R1),
-        SignatureScheme::ECDSA_NISTP384_SHA384 => Ok(ecc_curve_id_ECC_SECP384R1),
-        SignatureScheme::ECDSA_NISTP521_SHA512 => Ok(ecc_curve_id_ECC_SECP521R1),
-        _ => Err("Not an ECDSA_NISTPxxx_SHAxxx scheme"),
     }
 }

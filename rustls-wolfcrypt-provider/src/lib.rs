@@ -41,8 +41,6 @@ pub mod hmac;
 
 use crate::hmac::WCShaHmac;
 
-pub mod types;
-
 type SigningKeyResult = Result<Arc<dyn rustls::sign::SigningKey>, rustls::Error>;
 type SigningKeyFn = dyn Fn(&PrivateKeyDer<'static>) -> SigningKeyResult;
 type SigningAlgorithms = Vec<Box<SigningKeyFn>>;

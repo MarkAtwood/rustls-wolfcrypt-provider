@@ -280,41 +280,88 @@ mod tests {
 mod integration_tests {
     use super::*;
     use rustls::pki_types::{PrivateSec1KeyDer, PrivatePkcs8KeyDer};
-    use wolfcrypt_rs::*;
-    use core::mem;
-    use crate::types::*;
-    use foreign_types::ForeignType;
+
+    /// Build a SEC1 ECPrivateKey DER for P-256 from a raw 32-byte private scalar
+    /// and a 65-byte uncompressed public key (0x04 || X || Y).
+    ///
+    /// Structure (RFC 5915 ECPrivateKey with namedCurve and publicKey):
+    ///   SEQUENCE {
+    ///     version INTEGER (1),
+    ///     privateKey OCTET STRING (32 bytes),
+    ///     [0] EXPLICIT OID id-prime256v1,
+    ///     [1] EXPLICIT BIT STRING (uncompressed point)
+    ///   }
+    ///
+    /// This matches what wc_EccPrivateKeyToDer produces for P-256 keys.
+    fn make_sec1_p256(priv_bytes: &[u8; 32], pub_bytes: &[u8; 65]) -> alloc::vec::Vec<u8> {
+        // OID for id-prime256v1 (1.2.840.10045.3.1.7): 2a 86 48 ce 3d 03 01 07
+        let oid: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+
+        // [0] namedCurve: a0 0a 06 08 <oid>
+        let named_curve: alloc::vec::Vec<u8> = {
+            let mut v = alloc::vec![0xa0, 0x0a, 0x06, 0x08];
+            v.extend_from_slice(oid);
+            v
+        };
+
+        // [1] publicKey: a1 44 03 42 00 <65 bytes>
+        let pub_key_field: alloc::vec::Vec<u8> = {
+            let mut v = alloc::vec![0xa1, 0x44, 0x03, 0x42, 0x00];
+            v.extend_from_slice(pub_bytes);
+            v
+        };
+
+        // privateKey: 04 20 <32 bytes>
+        let priv_field: alloc::vec::Vec<u8> = {
+            let mut v = alloc::vec![0x04, 0x20];
+            v.extend_from_slice(priv_bytes);
+            v
+        };
+
+        // version: 02 01 01
+        let version: &[u8] = &[0x02, 0x01, 0x01];
+
+        let inner_len = version.len()
+            + priv_field.len()
+            + named_curve.len()
+            + pub_key_field.len();
+
+        let mut der = alloc::vec![0x30, inner_len as u8];
+        der.extend_from_slice(version);
+        der.extend_from_slice(&priv_field);
+        der.extend_from_slice(&named_curve);
+        der.extend_from_slice(&pub_key_field);
+        der
+    }
 
     #[test]
-    fn test_ecdsa_try_from_sec1_wolfcrypt_rs() {
-        // Generate P-256 key via wolfcrypt-rs, same as the e2e test does
-        let mut rng: WC_RNG = unsafe { mem::zeroed() };
-        let rng_object = WCRngObject::new(&mut rng);
-        rng_object.init();
-        let mut ecc_key_c_type: ecc_key = unsafe { mem::zeroed() };
-        let key_object = ECCKeyObject::new(&mut ecc_key_c_type);
-        key_object.init();
+    fn test_ecdsa_try_from_sec1() {
+        // Generate a P-256 key via the safe wrapper — no wolfcrypt_rs needed.
+        let mut rng = wolfssl_wolfcrypt::random::RNG::new().expect("RNG::new");
+        let curve_size = wolfssl_wolfcrypt::ecc::ECC::get_curve_size_from_id(
+            wolfssl_wolfcrypt::ecc::ECC::SECP256R1,
+        ).expect("curve_size");
+        let mut key = wolfssl_wolfcrypt::ecc::ECC::generate_ex(
+            curve_size, &mut rng, wolfssl_wolfcrypt::ecc::ECC::SECP256R1, None, None,
+        ).expect("generate");
 
-        let ret = unsafe {
-            wc_ecc_make_key_ex(rng_object.as_ptr(), 32, key_object.as_ptr(), ecc_curve_id_ECC_SECP256R1)
-        };
-        assert_eq!(ret, 0, "wc_ecc_make_key_ex failed: {}", ret);
+        let mut priv_bytes = [0u8; 32];
+        key.export_private(&mut priv_bytes).expect("export_private");
 
-        let mut der_buf = vec![0u8; 200];
-        let ret = unsafe {
-            wc_EccPrivateKeyToDer(key_object.as_ptr(), der_buf.as_mut_ptr(), der_buf.len() as u32)
-        };
-        assert!(ret > 0, "wc_EccPrivateKeyToDer failed: {}", ret);
-        der_buf.resize(ret as usize, 0);
+        let mut x963 = [0u8; 65];
+        key.export_x963(&mut x963).expect("export_x963");
+        let pub_bytes: &[u8; 65] = &x963;
 
-        // Try loading as SEC1 key
-        let sec1_key = PrivateKeyDer::from(PrivateSec1KeyDer::from(der_buf.as_slice()));
-        let result = EcdsaSigningKey::try_from(&sec1_key);
-        assert!(result.is_ok(), "SEC1 try_from failed: {:?}", result.err());
+        let sec1_der = make_sec1_p256(&priv_bytes, pub_bytes);
 
-        // Try loading as PKCS8-labeled (but SEC1 content)
-        let pkcs8_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(der_buf.as_slice()));
-        let result2 = EcdsaSigningKey::try_from(&pkcs8_key);
-        assert!(result2.is_ok(), "PKCS8-wrapped-SEC1 try_from failed: {:?}", result2.err());
+        // Verify EcdsaSigningKey accepts SEC1 input.
+        let sec1_key = PrivateKeyDer::from(PrivateSec1KeyDer::from(sec1_der.as_slice()));
+        EcdsaSigningKey::try_from(&sec1_key).expect("SEC1 try_from failed");
+
+        // Verify EcdsaSigningKey accepts SEC1 bytes mislabeled as PKCS8
+        // (this is what the e2e test generates via wc_EccPrivateKeyToDer
+        // wrapped in PrivatePkcs8KeyDer).
+        let pkcs8_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(sec1_der.as_slice()));
+        EcdsaSigningKey::try_from(&pkcs8_key).expect("PKCS8-labeled-SEC1 try_from failed");
     }
 }

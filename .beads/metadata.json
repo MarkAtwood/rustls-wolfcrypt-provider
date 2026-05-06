@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "rustls_wolfcrypt_provider",
+  "project_id": "552f99f5-838e-4bed-bf16-f9d36e33c7b0"
+}

@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
-use chacha20poly1305::KeySizeUser;
+
 use rustls::crypto::cipher::{
     make_tls12_aad, make_tls13_aad, AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv,
     KeyBlockShape, MessageDecrypter, MessageEncrypter, Nonce, OutboundOpaqueMessage,
@@ -163,7 +163,7 @@ impl Tls13AeadAlgorithm for Chacha20Poly1305 {
     }
 
     fn key_len(&self) -> usize {
-        chacha20poly1305::ChaCha20Poly1305::key_size()
+        ChaCha20Poly1305::KEYSIZE
     }
 
     fn extract_keys(

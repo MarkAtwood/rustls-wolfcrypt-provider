@@ -1,4 +1,3 @@
-use alloc::vec;
 use rustls::pki_types::{AlgorithmIdentifier, InvalidSignature, SignatureVerificationAlgorithm};
 use rustls_pki_types::alg_id;
 use wolfssl_wolfcrypt::rsa::RSA;
@@ -30,11 +29,10 @@ impl SignatureVerificationAlgorithm for RsaPssSha256Verify {
         sha.finalize(&mut digest).map_err(|_| InvalidSignature)?;
 
         let mut rsa = RSA::new_public_from_der(public_key).map_err(|_| InvalidSignature)?;
-        let mut sig_buf = vec![0u8; signature.len()];
-        sig_buf.copy_from_slice(signature);
         let mut out = [0u8; RSA_PSS_OUT_SIZE];
 
-        rsa.pss_verify_check(&sig_buf, &mut out, &digest, RSA::HASH_TYPE_SHA256, RSA::MGF1SHA256)
+        // pss_verify_check takes signature as &[u8] (immutable); no copy needed.
+        rsa.pss_verify_check(signature, &mut out, &digest, RSA::HASH_TYPE_SHA256, RSA::MGF1SHA256)
             .map_err(|_| InvalidSignature)?;
         Ok(())
     }
@@ -64,11 +62,9 @@ impl SignatureVerificationAlgorithm for RsaPssSha384Verify {
         sha.finalize(&mut digest).map_err(|_| InvalidSignature)?;
 
         let mut rsa = RSA::new_public_from_der(public_key).map_err(|_| InvalidSignature)?;
-        let mut sig_buf = vec![0u8; signature.len()];
-        sig_buf.copy_from_slice(signature);
         let mut out = [0u8; RSA_PSS_OUT_SIZE];
 
-        rsa.pss_verify_check(&sig_buf, &mut out, &digest, RSA::HASH_TYPE_SHA384, RSA::MGF1SHA384)
+        rsa.pss_verify_check(signature, &mut out, &digest, RSA::HASH_TYPE_SHA384, RSA::MGF1SHA384)
             .map_err(|_| InvalidSignature)?;
         Ok(())
     }
@@ -98,11 +94,9 @@ impl SignatureVerificationAlgorithm for RsaPssSha512Verify {
         sha.finalize(&mut digest).map_err(|_| InvalidSignature)?;
 
         let mut rsa = RSA::new_public_from_der(public_key).map_err(|_| InvalidSignature)?;
-        let mut sig_buf = vec![0u8; signature.len()];
-        sig_buf.copy_from_slice(signature);
         let mut out = [0u8; RSA_PSS_OUT_SIZE];
 
-        rsa.pss_verify_check(&sig_buf, &mut out, &digest, RSA::HASH_TYPE_SHA512, RSA::MGF1SHA512)
+        rsa.pss_verify_check(signature, &mut out, &digest, RSA::HASH_TYPE_SHA512, RSA::MGF1SHA512)
             .map_err(|_| InvalidSignature)?;
         Ok(())
     }

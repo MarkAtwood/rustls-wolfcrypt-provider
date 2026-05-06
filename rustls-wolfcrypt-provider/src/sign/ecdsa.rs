@@ -246,9 +246,6 @@ impl Signer for EcdsaSigningKey {
 }
 
 
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

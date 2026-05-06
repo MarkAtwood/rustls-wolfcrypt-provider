@@ -54,12 +54,12 @@ impl Tls12AeadAlgorithm for Aes128Gcm {
         iv: &[u8],
         explicit: &[u8],
     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
-        let mut iv_as_vec = vec![0u8; GCM_NONCE_LENGTH];
-        iv_as_vec[..4].copy_from_slice(iv);
-        iv_as_vec[4..].copy_from_slice(explicit);
+        let mut iv_arr = [0u8; GCM_NONCE_LENGTH];
+        iv_arr[..4].copy_from_slice(iv);
+        iv_arr[4..].copy_from_slice(explicit);
         Ok(ConnectionTrafficSecrets::Aes128Gcm {
             key,
-            iv: Iv::new(iv_as_vec.try_into().unwrap()),
+            iv: Iv::new(iv_arr),
         })
     }
 }

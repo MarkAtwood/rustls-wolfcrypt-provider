@@ -21,7 +21,10 @@ impl crypto::tls12::Prf for WCPrfUsingHmac {
     }
 
     fn for_secret(&self, output: &mut [u8], secret: &[u8], label: &[u8], seed: &[u8]) {
-        wc_prf(output, secret, label, seed, self.0).expect("failed to calculate prf in for_secret")
+        // rustls::crypto::tls12::Prf::for_secret is infallible (no Result return).
+        // wc_PRF only fails on allocation failure or invalid parameters; both are
+        // abort-level in a TLS handshake context.
+        wc_prf(output, secret, label, seed, self.0).expect("wc_PRF failed")
     }
 }
 

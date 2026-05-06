@@ -1,4 +1,4 @@
-use crate::alloc::string::ToString;
+use alloc::string::ToString;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -39,24 +39,14 @@ impl fmt::Debug for EcdsaSigningKey {
     }
 }
 
-/// OID bytes for id-Ed25519 (1.3.101.112) in a 3-byte DER OID encoding: 06 03 2b 65 70
-/// Ed25519 PKCS#8 DER: 30 2e 02 01 00 30 05 06 03 2b 65 70 04 22 04 20 <32 bytes>
-/// The OID bytes (2b 65 70) start at offset 10 in a standard Ed25519 PKCS#8.
-const OID_ED25519_BYTES: &[u8] = &[0x2b, 0x65, 0x70];
+/// OID for id-ecPublicKey (1.2.840.10045.2.1) — the algorithm OID for ECDSA keys in PKCS8.
+const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
 
-/// OID bytes for id-Ed448 (1.3.101.113): 2b 65 71
-const OID_ED448_BYTES: &[u8] = &[0x2b, 0x65, 0x71];
+/// OID for id-Ed25519 (1.3.101.112) in encoded form.
+const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 
-/// Check whether a DER buffer contains an Ed25519 or Ed448 PKCS#8 key.
-/// These keys crash wc_EccPrivateKeyDecode in wolfssl 5.9.1 when given
-/// as input; reject them early to avoid the crash.
-fn is_eddsa_pkcs8(der: &[u8]) -> bool {
-    // Ed25519/Ed448 PKCS#8 DER: 30 ?? 02 01 00 30 05 06 03 <3 OID bytes>
-    // The 3 OID bytes start at offset 10.
-    der.len() > 12
-        && (der.get(10..13) == Some(OID_ED25519_BYTES)
-            || der.get(10..13) == Some(OID_ED448_BYTES))
-}
+/// OID for id-Ed448 (1.3.101.113) in encoded form.
+const OID_ED448: &[u8] = &[0x2b, 0x65, 0x71];
 
 impl TryFrom<&PrivateKeyDer<'_>> for EcdsaSigningKey {
     type Error = rustls::Error;
@@ -68,19 +58,33 @@ impl TryFrom<&PrivateKeyDer<'_>> for EcdsaSigningKey {
         let sec1_bytes: &[u8] = match value {
             PrivateKeyDer::Pkcs8(der) => {
                 let raw = der.secret_pkcs8_der();
-                // Guard: reject Ed25519/Ed448 PKCS8 early — they crash wc_EccPrivateKeyDecode.
-                if is_eddsa_pkcs8(raw) {
-                    return Err(rustls::Error::General(
-                        "Unsupported ECDSA key format (EdDSA key)".into(),
-                    ));
+                // Parse the PKCS8 structure to extract the algorithm OID.
+                // This is robust against variant encodings (unlike raw byte-offset checks).
+                match PrivateKeyInfo::try_from(raw) {
+                    Ok(pki) => {
+                        let oid_bytes = pki.algorithm.oid.as_bytes();
+                        // Reject EdDSA keys early: wc_EccPrivateKeyDecode crashes on
+                        // Ed25519/Ed448 PKCS8 input in wolfssl 5.9.1.
+                        if oid_bytes == OID_ED25519 || oid_bytes == OID_ED448 {
+                            return Err(rustls::Error::General(
+                                "Unsupported ECDSA key format (EdDSA key)".into(),
+                            ));
+                        }
+                        // For id-ecPublicKey keys, the inner private_key bytes are the
+                        // SEC1 ECPrivateKey DER that wc_EccPrivateKeyDecode expects.
+                        // For any other OID (unexpected), fall back to raw and let
+                        // import_der report the error.
+                        if oid_bytes == OID_EC_PUBLIC_KEY {
+                            pki.private_key
+                        } else {
+                            raw
+                        }
+                    }
+                    // Not valid PKCS8 — treat the raw bytes as SEC1 directly.
+                    // The e2e test generates keys with wc_EccPrivateKeyToDer (SEC1)
+                    // then wraps them in PrivatePkcs8KeyDer without re-encoding.
+                    Err(_) => raw,
                 }
-                // Unwrap the PKCS8 outer layer to get the SEC1 ECPrivateKey DER.
-                // pkcs8::PrivateKeyInfo::try_from parses the AlgorithmIdentifier and
-                // returns private_key as the inner OCTET STRING value.
-                // For id-ecPublicKey keys that inner value is the SEC1 ECPrivateKey DER.
-                PrivateKeyInfo::try_from(raw)
-                    .map(|pki| pki.private_key)
-                    .unwrap_or(raw) // fall back to raw if PKCS8 parse fails
             }
             PrivateKeyDer::Sec1(der) => der.secret_sec1_der(),
             PrivateKeyDer::Pkcs1(_) => {

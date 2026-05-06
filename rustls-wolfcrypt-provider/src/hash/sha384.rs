@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use rustls::crypto::hash;
 use wolfssl_wolfcrypt::sha::SHA384;
 
@@ -8,8 +7,9 @@ pub struct WCSha384;
 impl hash::Hash for WCSha384 {
     fn start(&self) -> Box<dyn hash::Context> {
         Box::new(WCSha384Context {
+            // Treat SHA384::new() failure as abort-level: it only fails on
+            // allocation failure, which the rustls hash trait cannot propagate.
             sha: SHA384::new().expect("SHA384::new failed"),
-            data: Vec::new(),
         })
     }
 
@@ -30,21 +30,18 @@ impl hash::Hash for WCSha384 {
 
 struct WCSha384Context {
     sha: SHA384,
-    data: Vec<u8>,
 }
 
 impl hash::Context for WCSha384Context {
     fn fork_finish(&self) -> hash::Output {
-        let forked = self.fork();
-        forked.finish()
+        self.fork().finish()
     }
 
     fn fork(&self) -> Box<dyn hash::Context> {
-        let mut sha = SHA384::new().expect("SHA384::new failed in fork");
-        sha.update(&self.data).expect("SHA384::update failed in fork");
+        // wc_Sha384Copy clones the internal wolfSSL SHA-384 state in O(1),
+        // avoiding O(N) data-replay of all bytes fed so far.
         Box::new(WCSha384Context {
-            sha,
-            data: self.data.clone(),
+            sha: self.sha.copy().expect("SHA384::copy failed"),
         })
     }
 
@@ -55,7 +52,6 @@ impl hash::Context for WCSha384Context {
     }
 
     fn update(&mut self, data: &[u8]) {
-        self.data.extend_from_slice(data);
         self.sha.update(data).expect("SHA384::update failed");
     }
 }
@@ -78,5 +74,23 @@ mod tests {
         let hash_str2 = hex::encode(hash2);
 
         assert_eq!(hash_str1, hash_str2);
+    }
+
+    #[test]
+    fn test_sha384_fork() {
+        let wcsha384 = WCSha384;
+        let mut ctx = wcsha384.start();
+        ctx.update(b"hello ");
+
+        let forked = ctx.fork();
+        ctx.update(b"world");
+        let forked_finish = {
+            let mut f = forked;
+            f.update(b"world");
+            f.finish()
+        };
+        let orig_finish = ctx.finish();
+
+        assert_eq!(hex::encode(orig_finish), hex::encode(forked_finish));
     }
 }

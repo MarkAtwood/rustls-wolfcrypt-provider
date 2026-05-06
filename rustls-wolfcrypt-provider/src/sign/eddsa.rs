@@ -11,12 +11,16 @@ use zeroize::Zeroizing;
 
 const ALL_EDDSA_SCHEMES: &[SignatureScheme] = &[SignatureScheme::ED25519];
 
-/// Ed25519 private key size (private key only, not including public key).
+/// Ed25519 private key size (private seed only, 32 bytes).
 const PRIV_KEY_SIZE: usize = WcEd25519::KEY_SIZE;
+/// Ed25519 public key size (32 bytes).
+const PUB_KEY_SIZE: usize = WcEd25519::PUB_KEY_SIZE;
 
 #[derive(Clone)]
 pub struct Ed25519PrivateKey {
     priv_key: Arc<Zeroizing<Vec<u8>>>,
+    /// Derived public key cached at import time to avoid per-sign scalar multiply.
+    pub_key: Arc<[u8; PUB_KEY_SIZE]>,
     algo: SignatureAlgorithm,
 }
 
@@ -54,8 +58,19 @@ impl TryFrom<&PrivateKeyDer<'_>> for Ed25519PrivateKey {
                 }
                 let raw_priv = &pki.private_key[2..2 + PRIV_KEY_SIZE];
 
+                // Derive the public key once at import time and cache it.
+                // This avoids a scalar multiply on every sign() call.
+                let mut ed = WcEd25519::new()
+                    .map_err(|_| rustls::Error::General("Ed25519 init failed".into()))?;
+                ed.import_private_only(raw_priv)
+                    .map_err(|_| rustls::Error::General("Ed25519 import_private_only failed".into()))?;
+                let mut pub_buf = [0u8; PUB_KEY_SIZE];
+                ed.make_public(&mut pub_buf)
+                    .map_err(|_| rustls::Error::General("Ed25519 make_public failed".into()))?;
+
                 Ok(Self {
                     priv_key: Arc::new(Zeroizing::new(raw_priv.to_vec())),
+                    pub_key: Arc::new(pub_buf),
                     algo: SignatureAlgorithm::ED25519,
                 })
             }
@@ -72,6 +87,7 @@ impl SigningKey for Ed25519PrivateKey {
             if offered.contains(&scheme) {
                 Some(Box::new(Ed25519Signer {
                     priv_key: self.priv_key.clone(),
+                    pub_key: self.pub_key.clone(),
                     scheme,
                 }) as Box<dyn Signer>)
             } else {
@@ -88,6 +104,8 @@ impl SigningKey for Ed25519PrivateKey {
 #[derive(Clone)]
 pub struct Ed25519Signer {
     priv_key: Arc<Zeroizing<Vec<u8>>>,
+    /// Cached public key avoids re-deriving it via scalar multiply on each sign.
+    pub_key: Arc<[u8; PUB_KEY_SIZE]>,
     scheme: SignatureScheme,
 }
 
@@ -104,15 +122,12 @@ impl Signer for Ed25519Signer {
         let mut ed = WcEd25519::new()
             .map_err(|_| rustls::Error::General("Ed25519 init failed".into()))?;
 
-        // Import the private seed, re-derive the public key, and import the pair.
-        ed.import_private_only(&self.priv_key)
-            .map_err(|e| rustls::Error::General(alloc::format!("Ed25519 import private failed: {}", e)))?;
-        let mut pub_buf = [0u8; WcEd25519::PUB_KEY_SIZE];
-        ed.make_public(&mut pub_buf)
-            .map_err(|e| rustls::Error::General(alloc::format!("Ed25519 make_public failed: {}", e)))?;
-        // Now import_public_ex sets key->p so sign_msg can access the public key.
-        ed.import_public_ex(&pub_buf, true)
-            .map_err(|e| rustls::Error::General(alloc::format!("Ed25519 import public failed: {}", e)))?;
+        // Import private seed plus the cached public key in a single call.
+        // This skips the make_public scalar multiply that would occur if we
+        // imported the private key alone. trusted=true because we computed
+        // pub_key ourselves from the private seed at import time.
+        ed.import_private_key_ex(&self.priv_key, Some(self.pub_key.as_ref()), true)
+            .map_err(|e| rustls::Error::General(alloc::format!("Ed25519 import_private_key_ex failed: {}", e)))?;
 
         let mut sig = [0u8; WcEd25519::SIG_SIZE];
         let sig_len = ed
@@ -151,7 +166,10 @@ mod tests {
 
         // Build PKCS8 DER: 30 2e 02 01 00 30 05 06 03 2b 65 70 04 22 04 20 <32 bytes>
         let mut pkcs8_der = [0u8; 48];
-        pkcs8_der[0..16].copy_from_slice(&[0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20]);
+        pkcs8_der[0..16].copy_from_slice(&[
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+            0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+        ]);
         pkcs8_der[16..48].copy_from_slice(&priv_raw);
 
         // Create Ed25519PrivateKey

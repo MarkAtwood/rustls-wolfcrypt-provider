@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use rustls::crypto::hash;
 use wolfssl_wolfcrypt::sha::SHA256;
 
@@ -8,8 +7,9 @@ pub struct WCSha256;
 impl hash::Hash for WCSha256 {
     fn start(&self) -> Box<dyn hash::Context> {
         Box::new(WCSha256Context {
+            // Treat SHA256::new() failure as abort-level: it only fails on
+            // allocation failure, which the rustls hash trait cannot propagate.
             sha: SHA256::new().expect("SHA256::new failed"),
-            data: Vec::new(),
         })
     }
 
@@ -30,21 +30,18 @@ impl hash::Hash for WCSha256 {
 
 struct WCSha256Context {
     sha: SHA256,
-    data: Vec<u8>,
 }
 
 impl hash::Context for WCSha256Context {
     fn fork_finish(&self) -> hash::Output {
-        let forked = self.fork();
-        forked.finish()
+        self.fork().finish()
     }
 
     fn fork(&self) -> Box<dyn hash::Context> {
-        let mut sha = SHA256::new().expect("SHA256::new failed in fork");
-        sha.update(&self.data).expect("SHA256::update failed in fork");
+        // wc_Sha256Copy clones the internal wolfSSL SHA-256 state in O(1),
+        // avoiding O(N) data-replay of all bytes fed so far.
         Box::new(WCSha256Context {
-            sha,
-            data: self.data.clone(),
+            sha: self.sha.copy().expect("SHA256::copy failed"),
         })
     }
 
@@ -55,7 +52,6 @@ impl hash::Context for WCSha256Context {
     }
 
     fn update(&mut self, data: &[u8]) {
-        self.data.extend_from_slice(data);
         self.sha.update(data).expect("SHA256::update failed");
     }
 }
@@ -78,5 +74,25 @@ mod tests {
         let hash_str2 = hex::encode(hash2);
 
         assert_eq!(hash_str1, hash_str2);
+    }
+
+    #[test]
+    fn test_sha256_fork() {
+        // Verify that fork() produces the same result as finishing the original,
+        // and that subsequent updates to the fork don't affect the original.
+        let wcsha256 = WCSha256;
+        let mut ctx = wcsha256.start();
+        ctx.update(b"hello ");
+
+        let forked = ctx.fork();
+        ctx.update(b"world");
+        let forked_finish = {
+            let mut f = forked;
+            f.update(b"world");
+            f.finish()
+        };
+        let orig_finish = ctx.finish();
+
+        assert_eq!(hex::encode(orig_finish), hex::encode(forked_finish));
     }
 }

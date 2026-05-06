@@ -65,6 +65,9 @@ impl KeyExchangeSecP384r1 {
         .map_err(|_| rustls::Error::General("Failed to import ECC private key".into()))?;
 
         // Import peer public key from uncompressed X9.63 point (0x04 || X || Y).
+        // wc_ecc_import_x963 validates that the point is on the named curve,
+        // rejecting off-curve, low-order, and identity points. This is the
+        // equivalent of the explicit check performed for X25519 via check_public().
         let mut pub_key = ECC::import_x963(peer_pub_key, None, None)
             .map_err(|_| rustls::Error::General("Failed to import peer ECC public key".into()))?;
 

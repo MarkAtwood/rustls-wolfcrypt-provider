@@ -122,6 +122,13 @@ impl MessageDecrypter for WCTls12Decrypter {
         let payload = &mut m.payload;
         let payload_len = payload.len();
 
+        // TLS 1.2 AES-GCM payload: explicit_nonce(8) || ciphertext || tag(16).
+        // Minimum valid payload is explicit_nonce + tag = 24 bytes.
+        let explicit_nonce_len = GCM_NONCE_LENGTH - 4; // 8
+        if payload_len < explicit_nonce_len + GCM_TAG_LENGTH {
+            return Err(rustls::Error::DecryptError);
+        }
+
         let mut nonce = [0u8; GCM_NONCE_LENGTH];
         nonce[..(GCM_NONCE_LENGTH - 8)].copy_from_slice(self.implicit_iv.as_ref());
         nonce[(GCM_NONCE_LENGTH - 8)..].copy_from_slice(&payload[..(GCM_NONCE_LENGTH - 4)]);
@@ -132,14 +139,19 @@ impl MessageDecrypter for WCTls12Decrypter {
             seq,
             m.typ,
             m.version,
-            payload_len - GCM_TAG_LENGTH - (GCM_NONCE_LENGTH - 4),
+            payload_len - GCM_TAG_LENGTH - explicit_nonce_len,
         );
 
         let payload_start = GCM_NONCE_LENGTH - 4;
         let payload_end = payload_len - GCM_TAG_LENGTH;
         let ciphertext = payload[payload_start..payload_end].to_vec();
+        // Note: plaintext is a plain Vec; TLS record content is not zeroized on drop,
+        // consistent with rustls's own behavior for record buffers.
         let mut plaintext = vec![0u8; ciphertext.len()];
 
+        // GCM is re-initialized per-call because wolfssl_wolfcrypt::aes::GCM does not
+        // implement Send/Sync and cannot be stored in the cipher struct. A future
+        // optimization would add Send+Sync to GCM and store a pre-initialized context.
         let mut gcm =
             GCM::new().map_err(|_| rustls::Error::General("wc_AesGcmInit failed".into()))?;
         gcm.init(&self.key)
@@ -237,6 +249,10 @@ impl MessageDecrypter for WCTls13Cipher {
         seq: u64,
     ) -> Result<InboundPlainMessage<'a>, rustls::Error> {
         let payload = &mut m.payload;
+        // TLS 1.3 payload must contain at least the 16-byte auth tag.
+        if payload.len() < GCM_TAG_LENGTH {
+            return Err(rustls::Error::DecryptError);
+        }
         let nonce = Nonce::new(&self.iv, seq);
         let aad = make_tls13_aad(payload.len());
         let mut auth_tag = [0u8; GCM_TAG_LENGTH];

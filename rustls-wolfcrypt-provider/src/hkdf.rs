@@ -56,7 +56,13 @@ impl RustlsHkdf for WCHkdfUsingHmac {
         key: &rustls::crypto::tls13::OkmBlock,
         message: &[u8],
     ) -> rustls::crypto::hmac::Tag {
-        // HMAC(key, message) = hkdf_extract(salt=key, ikm=message)
+        // HMAC(key, message) used by the TLS 1.3 finished message MAC.
+        //
+        // Uses hkdf_extract(salt=key, ikm=message) which is mathematically identical
+        // to HMAC(key, message) per RFC 5869 §2.2. Direct HMAC::finalize is affected
+        // by an ABI mismatch between the wolfssl-wolfcrypt (5.9.1) and wolfcrypt-rs
+        // (5.7.6) static libraries linked simultaneously during this transition period.
+        // This workaround will be removed when wolfcrypt-rs is eliminated.
         let typ = self.0.hmac_type();
         let hash_len = self.0.hash_len();
         let mut digest = vec![0u8; hash_len];

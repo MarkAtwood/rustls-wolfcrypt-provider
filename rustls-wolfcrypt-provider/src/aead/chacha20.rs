@@ -51,10 +51,12 @@ impl Tls12AeadAlgorithm for Chacha20Poly1305 {
         iv: &[u8],
         _explicit: &[u8],
     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
-        debug_assert_eq!(NONCE_LEN, iv.len());
+        let iv_array: [u8; NONCE_LEN] = iv
+            .try_into()
+            .map_err(|_| UnsupportedOperationError)?;
         Ok(ConnectionTrafficSecrets::Chacha20Poly1305 {
             key,
-            iv: Iv::new(iv[..].try_into().unwrap()),
+            iv: Iv::new(iv_array),
         })
     }
 }
@@ -109,6 +111,10 @@ impl MessageDecrypter for WCTls12Cipher {
         seq: u64,
     ) -> Result<InboundPlainMessage<'a>, rustls::Error> {
         let payload = &mut m.payload;
+        // ChaCha20-Poly1305 payload must contain at least the 16-byte auth tag.
+        if payload.len() < CHACHAPOLY1305_OVERHEAD {
+            return Err(rustls::Error::DecryptError);
+        }
         let message_len = payload.len() - CHACHAPOLY1305_OVERHEAD;
         let nonce = Nonce::new(&self.iv, seq);
         let aad = make_tls12_aad(seq, m.typ, m.version, message_len);
@@ -227,6 +233,10 @@ impl MessageDecrypter for WCTls13Cipher {
         seq: u64,
     ) -> Result<InboundPlainMessage<'a>, rustls::Error> {
         let payload = &mut m.payload;
+        // ChaCha20-Poly1305 payload must contain at least the 16-byte auth tag.
+        if payload.len() < CHACHAPOLY1305_OVERHEAD {
+            return Err(rustls::Error::DecryptError);
+        }
         let nonce = Nonce::new(&self.iv, seq);
         let aad = make_tls13_aad(payload.len());
         let mut auth_tag = [0u8; CHACHAPOLY1305_OVERHEAD];
@@ -435,7 +445,5 @@ mod tests {
             "Insufficient number of tests run: {}",
             counter
         );
-
-        log::info!("Counter: {}", counter);
     }
 }

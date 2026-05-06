@@ -1,8 +1,7 @@
-use crate::error::check_if_zero;
 use alloc::{boxed::Box, vec, vec::Vec};
-use core::mem;
 use rustls::crypto;
-use wolfcrypt_rs::*;
+use wolfssl_wolfcrypt::hkdf::hkdf_extract;
+use wolfssl_wolfcrypt::hmac::HMAC;
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy)]
@@ -12,40 +11,16 @@ pub enum WCShaHmac {
 }
 
 impl WCShaHmac {
-    fn digest_size(&self) -> usize {
+    pub fn hmac_type(&self) -> i32 {
         match self {
-            WCShaHmac::Sha256 => WC_SHA256_DIGEST_SIZE as usize,
-            WCShaHmac::Sha384 => WC_SHA384_DIGEST_SIZE as usize,
-        }
-    }
-
-    fn algorithm(&self) -> i32 {
-        match self {
-            WCShaHmac::Sha256 => WC_SHA256.try_into().unwrap(),
-            WCShaHmac::Sha384 => WC_SHA384.try_into().unwrap(),
-        }
-    }
-
-    pub fn new(hash_type: wc_HashType) -> Self {
-        match hash_type {
-            WC_SHA256 => WCShaHmac::Sha256,
-            WC_SHA384 => WCShaHmac::Sha384,
-            _ => panic!("Unsupported hash type"),
-        }
-    }
-
-    pub fn hash_type(&self) -> wc_HashType {
-        match self {
-            WCShaHmac::Sha256 => WC_SHA256,
-            WCShaHmac::Sha384 => WC_SHA384,
+            WCShaHmac::Sha256 => HMAC::TYPE_SHA256,
+            WCShaHmac::Sha384 => HMAC::TYPE_SHA384,
         }
     }
 
     pub fn hash_len(&self) -> usize {
-        match self {
-            WCShaHmac::Sha256 => WC_SHA256_DIGEST_SIZE as usize,
-            WCShaHmac::Sha384 => WC_SHA384_DIGEST_SIZE as usize,
-        }
+        HMAC::get_hmac_size_by_type(self.hmac_type())
+            .expect("get_hmac_size_by_type failed")
     }
 }
 
@@ -58,7 +33,7 @@ impl crypto::hmac::Hmac for WCShaHmac {
     }
 
     fn hash_output_len(&self) -> usize {
-        self.digest_size()
+        self.hash_len()
     }
 }
 
@@ -69,52 +44,27 @@ struct WCHmacKey {
 
 impl crypto::hmac::Key for WCHmacKey {
     fn sign_concat(&self, first: &[u8], middle: &[&[u8]], last: &[u8]) -> crypto::hmac::Tag {
-        let hmac_object = self.hmac_init();
-        self.hmac_update(hmac_object, first);
+        // Accumulate all data, then compute HMAC(key, data).
+        // We use hkdf_extract(salt=key, ikm=data) which is mathematically
+        // equivalent to HMAC(key, data) and avoids the HMAC struct ABI
+        // mismatch between wolfssl-wolfcrypt and wolfcrypt-rs builds.
+        let typ = self.variant.hmac_type();
+        let digest_len = self.variant.hash_len();
+
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(first);
         for m in middle {
-            self.hmac_update(hmac_object, m)
+            data.extend_from_slice(m);
         }
-        self.hmac_update(hmac_object, last);
-        let digest = self.hmac_final(hmac_object);
+        data.extend_from_slice(last);
+
+        let mut digest = vec![0u8; digest_len];
+        hkdf_extract(typ, Some(&self.key), &data, &mut digest)
+            .expect("hkdf_extract (HMAC) failed");
         crypto::hmac::Tag::new(&digest)
     }
 
     fn tag_len(&self) -> usize {
-        self.variant.digest_size()
-    }
-}
-
-impl WCHmacKey {
-    fn hmac_init(&self) -> *mut Hmac {
-        let hmac_ptr = Box::into_raw(Box::new(unsafe { mem::zeroed::<Hmac>() }));
-
-        let ret = unsafe {
-            wc_HmacSetKey(
-                hmac_ptr,
-                self.variant.algorithm(),
-                self.key.as_ptr(),
-                self.key.len() as word32,
-            )
-        };
-        check_if_zero(ret).expect("wc_HmacSetKey failed");
-        hmac_ptr
-    }
-
-    fn hmac_update(&self, hmac_ptr: *mut Hmac, input: &[u8]) {
-        let ret = unsafe { wc_HmacUpdate(hmac_ptr, input.as_ptr(), input.len() as word32) };
-        check_if_zero(ret).expect("wc_HmacUpdate failed");
-    }
-
-    fn hmac_final(&self, hmac_ptr: *mut Hmac) -> Vec<u8> {
-        let mut digest = vec![0u8; self.variant.digest_size()];
-        let ret = unsafe { wc_HmacFinal(hmac_ptr, digest.as_mut_ptr()) };
-        check_if_zero(ret).expect("wc_HmacFinal failed");
-
-        unsafe {
-            wc_HmacFree(hmac_ptr);
-            drop(Box::from_raw(hmac_ptr));
-        }
-
-        digest
+        self.variant.hash_len()
     }
 }

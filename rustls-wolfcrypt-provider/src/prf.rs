@@ -1,9 +1,9 @@
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use rustls::crypto;
-use wolfcrypt_rs::*;
+use wolfssl_wolfcrypt::prf::{prf, PRF_HASH_SHA256, PRF_HASH_SHA384};
 
-use crate::error::check_if_zero;
-use crate::hmac::*;
+use crate::hmac::WCShaHmac;
 
 pub struct WCPrfUsingHmac(pub WCShaHmac);
 
@@ -32,29 +32,18 @@ fn wc_prf(
     seed: &[u8],
     hmac_variant: WCShaHmac,
 ) -> Result<(), rustls::Error> {
-    let mac_algorithm = match hmac_variant {
-        WCShaHmac::Sha256 => wc_MACAlgorithm_sha256_mac,
-        WCShaHmac::Sha384 => wc_MACAlgorithm_sha384_mac,
+    let hash_type = match hmac_variant {
+        WCShaHmac::Sha256 => PRF_HASH_SHA256,
+        WCShaHmac::Sha384 => PRF_HASH_SHA384,
     };
 
-    let ret = unsafe {
-        wc_PRF_TLS(
-            output.as_mut_ptr(),
-            output.len() as word32,
-            secret.as_ptr(),
-            secret.len() as word32,
-            label.as_ptr(),
-            label.len() as word32,
-            seed.as_ptr(),
-            seed.len() as word32,
-            1,
-            mac_algorithm.try_into().unwrap(),
-            core::ptr::null_mut(),
-            INVALID_DEVID,
-        )
-    };
+    // wc_PRF takes a combined seed; TLS PRF is defined as PRF(secret, label || seed)
+    let mut combined_seed: Vec<u8> = Vec::with_capacity(label.len() + seed.len());
+    combined_seed.extend_from_slice(label);
+    combined_seed.extend_from_slice(seed);
 
-    check_if_zero(ret).map_err(|_| rustls::Error::General("wc_PRF_TLS failed".into()))?;
+    prf(secret, &combined_seed, hash_type, output)
+        .map_err(|_| rustls::Error::General("wc_PRF failed".into()))?;
     Ok(())
 }
 

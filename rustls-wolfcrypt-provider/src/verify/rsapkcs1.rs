@@ -1,14 +1,31 @@
-use crate::error::check_if_zero;
-use crate::types::*;
-use alloc::vec::Vec;
-use core::ffi::c_void;
-use core::mem;
-use foreign_types::ForeignType;
 use rustls::pki_types::{AlgorithmIdentifier, InvalidSignature, SignatureVerificationAlgorithm};
-
-use core::ptr;
 use rustls_pki_types::alg_id;
-use wolfcrypt_rs::*;
+use signature::Verifier;
+use wolfssl_wolfcrypt::rsa_pkcs1v15::{Sha256, Sha384, Sha512, VerifyingKey};
+
+/// Attempt PKCS#1 v1.5 verification against each supported key size.
+///
+/// Tries RSA-2048 (256 B), RSA-3072 (384 B), and RSA-4096 (512 B).
+/// Returns `Ok(())` on the first match, `InvalidSignature` if none succeed.
+macro_rules! pkcs1_verify {
+    ($hash:ty, $public_key:expr, $message:expr, $signature:expr) => {{
+        macro_rules! try_size {
+            ($n:literal) => {
+                if let Ok(vk) = VerifyingKey::<$hash, $n>::from_public_der($public_key) {
+                    if let Ok(sig) =
+                        wolfssl_wolfcrypt::rsa_pkcs1v15::Signature::<$n>::try_from($signature)
+                    {
+                        return vk.verify($message, &sig).map_err(|_| InvalidSignature);
+                    }
+                }
+            };
+        }
+        try_size!(256);
+        try_size!(384);
+        try_size!(512);
+        Err(InvalidSignature)
+    }};
+}
 
 #[derive(Debug)]
 pub struct RsaPkcs1Sha256Verify;
@@ -28,51 +45,7 @@ impl SignatureVerificationAlgorithm for RsaPkcs1Sha256Verify {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), InvalidSignature> {
-        let signature: Vec<u8> = signature.to_vec();
-        let mut rsa_key_c_type: RsaKey = unsafe { mem::zeroed() };
-        let rsa_key_object = unsafe { RsaKeyObject::from_ptr(&mut rsa_key_c_type) };
-        let mut ret;
-
-        ret = unsafe { wc_InitRsaKey(rsa_key_object.as_ptr(), ptr::null_mut()) };
-        check_if_zero(ret).map_err(|_| InvalidSignature)?;
-
-        let mut idx = 0;
-        ret = unsafe {
-            wc_RsaPublicKeyDecode(
-                public_key.as_ptr(),
-                &mut idx,
-                rsa_key_object.as_ptr(),
-                public_key.len() as word32,
-            )
-        };
-        check_if_zero(ret).map_err(|_| InvalidSignature)?;
-
-        let derefenced_rsa_key_c_type = unsafe { *(rsa_key_object.as_ptr()) };
-
-        // Verify the message signed with RSA-PSS.
-        // In this case 'message' has been, supposedly,
-        // been signed by 'signature'.
-        // Also takes care of the hashing:
-        // https://www.wolfssl.com/documentation/manuals/wolfssl/group__Signature.html#function-wc_signatureverify.
-        ret = unsafe {
-            wc_SignatureVerify(
-                wc_HashType_WC_HASH_TYPE_SHA256,
-                wc_SignatureType_WC_SIGNATURE_TYPE_RSA_W_ENC,
-                message.as_ptr(),
-                message.len() as word32,
-                signature.as_ptr(),
-                signature.len() as word32,
-                rsa_key_object.as_ptr() as *const c_void,
-                mem::size_of_val(&derefenced_rsa_key_c_type)
-                    .try_into()
-                    .unwrap(),
-            )
-        };
-
-        match check_if_zero(ret) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(InvalidSignature),
-        }
+        pkcs1_verify!(Sha256, public_key, message, signature)
     }
 }
 
@@ -94,51 +67,7 @@ impl SignatureVerificationAlgorithm for RsaPkcs1Sha384Verify {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), InvalidSignature> {
-        let signature: Vec<u8> = signature.to_vec();
-        let mut rsa_key_c_type: RsaKey = unsafe { mem::zeroed() };
-        let rsa_key_object = unsafe { RsaKeyObject::from_ptr(&mut rsa_key_c_type) };
-        let mut ret;
-
-        ret = unsafe { wc_InitRsaKey(rsa_key_object.as_ptr(), ptr::null_mut()) };
-        check_if_zero(ret).map_err(|_| InvalidSignature)?;
-
-        let mut idx = 0;
-        ret = unsafe {
-            wc_RsaPublicKeyDecode(
-                public_key.as_ptr(),
-                &mut idx,
-                rsa_key_object.as_ptr(),
-                public_key.len() as word32,
-            )
-        };
-        check_if_zero(ret).map_err(|_| InvalidSignature)?;
-
-        let dereferenced_rsa_key_c_type = unsafe { *(rsa_key_object.as_ptr()) };
-
-        // Verify the message signed with RSA-PSS.
-        // In this case 'message' has been, supposedly,
-        // been signed by 'signature'.
-        // Also takes care of the hashing:
-        // https://www.wolfssl.com/documentation/manuals/wolfssl/group__Signature.html#function-wc_signatureverify.
-        ret = unsafe {
-            wc_SignatureVerify(
-                wc_HashType_WC_HASH_TYPE_SHA384,
-                wc_SignatureType_WC_SIGNATURE_TYPE_RSA_W_ENC,
-                message.as_ptr(),
-                message.len() as word32,
-                signature.as_ptr(),
-                signature.len() as word32,
-                rsa_key_object.as_ptr() as *const c_void,
-                mem::size_of_val(&dereferenced_rsa_key_c_type)
-                    .try_into()
-                    .unwrap(),
-            )
-        };
-
-        match check_if_zero(ret) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(InvalidSignature),
-        }
+        pkcs1_verify!(Sha384, public_key, message, signature)
     }
 }
 
@@ -160,50 +89,6 @@ impl SignatureVerificationAlgorithm for RsaPkcs1Sha512Verify {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), InvalidSignature> {
-        let signature: Vec<u8> = signature.to_vec();
-        let mut rsa_key_c_type: RsaKey = unsafe { mem::zeroed() };
-        let rsa_key_object = unsafe { RsaKeyObject::from_ptr(&mut rsa_key_c_type) };
-        let mut ret;
-
-        ret = unsafe { wc_InitRsaKey(rsa_key_object.as_ptr(), ptr::null_mut()) };
-        check_if_zero(ret).map_err(|_| InvalidSignature)?;
-
-        let mut idx = 0;
-        ret = unsafe {
-            wc_RsaPublicKeyDecode(
-                public_key.as_ptr(),
-                &mut idx,
-                rsa_key_object.as_ptr(),
-                public_key.len() as word32,
-            )
-        };
-        check_if_zero(ret).map_err(|_| InvalidSignature)?;
-
-        let dereferenced_rsa_key_c_type = unsafe { *(rsa_key_object.as_ptr()) };
-
-        // Verify the message signed with RSA-PSS.
-        // In this case 'message' has been, supposedly,
-        // been signed by 'signature'.
-        // Also takes care of the hashing:
-        // https://www.wolfssl.com/documentation/manuals/wolfssl/group__Signature.html#function-wc_signatureverify.
-        ret = unsafe {
-            wc_SignatureVerify(
-                wc_HashType_WC_HASH_TYPE_SHA512,
-                wc_SignatureType_WC_SIGNATURE_TYPE_RSA_W_ENC,
-                message.as_ptr(),
-                message.len() as word32,
-                signature.as_ptr(),
-                signature.len() as word32,
-                rsa_key_object.as_ptr() as *const c_void,
-                mem::size_of_val(&dereferenced_rsa_key_c_type)
-                    .try_into()
-                    .unwrap(),
-            )
-        };
-
-        match check_if_zero(ret) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(InvalidSignature),
-        }
+        pkcs1_verify!(Sha512, public_key, message, signature)
     }
 }

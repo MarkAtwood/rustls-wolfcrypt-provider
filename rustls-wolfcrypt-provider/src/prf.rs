@@ -1,10 +1,11 @@
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use rustls::crypto;
-use wolfcrypt_rs::*;
+use wolfssl_wolfcrypt::prf::{prf, PRF_HASH_SHA256, PRF_HASH_SHA384};
 
-use crate::error::check_if_zero;
-use crate::hmac::*;
+use crate::hmac::WCShaHmac;
 
+#[derive(Debug)]
 pub struct WCPrfUsingHmac(pub WCShaHmac);
 
 impl crypto::tls12::Prf for WCPrfUsingHmac {
@@ -21,7 +22,10 @@ impl crypto::tls12::Prf for WCPrfUsingHmac {
     }
 
     fn for_secret(&self, output: &mut [u8], secret: &[u8], label: &[u8], seed: &[u8]) {
-        wc_prf(output, secret, label, seed, self.0).expect("failed to calculate prf in for_secret")
+        // rustls::crypto::tls12::Prf::for_secret is infallible (no Result return).
+        // wc_PRF only fails on allocation failure or invalid parameters; both are
+        // abort-level in a TLS handshake context.
+        wc_prf(output, secret, label, seed, self.0).expect("wc_PRF failed")
     }
 }
 
@@ -32,70 +36,61 @@ fn wc_prf(
     seed: &[u8],
     hmac_variant: WCShaHmac,
 ) -> Result<(), rustls::Error> {
-    let mac_algorithm = match hmac_variant {
-        WCShaHmac::Sha256 => wc_MACAlgorithm_sha256_mac,
-        WCShaHmac::Sha384 => wc_MACAlgorithm_sha384_mac,
+    let hash_type = match hmac_variant {
+        WCShaHmac::Sha256 => PRF_HASH_SHA256,
+        WCShaHmac::Sha384 => PRF_HASH_SHA384,
     };
 
-    let ret = unsafe {
-        wc_PRF_TLS(
-            output.as_mut_ptr(),
-            output.len() as word32,
-            secret.as_ptr(),
-            secret.len() as word32,
-            label.as_ptr(),
-            label.len() as word32,
-            seed.as_ptr(),
-            seed.len() as word32,
-            1,
-            mac_algorithm.try_into().unwrap(),
-            core::ptr::null_mut(),
-            INVALID_DEVID,
-        )
-    };
+    // wc_PRF takes a combined seed; TLS PRF is defined as PRF(secret, label || seed)
+    let mut combined_seed: Vec<u8> = Vec::with_capacity(label.len() + seed.len());
+    combined_seed.extend_from_slice(label);
+    combined_seed.extend_from_slice(seed);
 
-    check_if_zero(ret).map_err(|_| rustls::Error::General("wc_PRF_TLS failed".into()))?;
-    Ok(())
+    prf(secret, &combined_seed, hash_type, output)
+        .map_err(|_| rustls::Error::General("wc_PRF failed".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hex_literal::hex;
     use rustls::crypto::hmac::Hmac;
 
     #[test]
     fn test_hmac_variants() {
-        let test_cases = [(WCShaHmac::Sha256, 32), (WCShaHmac::Sha384, 48)];
+        // Key: "this is my key"
+        // Message (concatenated): "fake it" + "till you" + "make" + "it" = "fake ittill youmakeit"
+        // Expected values cross-validated with:
+        //   printf "fake ittill youmakeit" | openssl dgst -sha256 -hmac "this is my key"
+        //   printf "fake ittill youmakeit" | openssl dgst -sha384 -hmac "this is my key"
+        let test_cases: &[(WCShaHmac, &[u8])] = &[
+            (
+                WCShaHmac::Sha256,
+                &hex!("b49c38fefe72ea5d7a38e81b38f56d272642b9f63a53229f93d3a95fd3b327c9"),
+            ),
+            (
+                WCShaHmac::Sha384,
+                &hex!("aec2deee7ee331147fbb0bfdb06cae125a8979dcc2fea091117202fdcc76094c410310788a7d4f49297b40a6a5a0864b"),
+            ),
+        ];
 
-        for (variant, expected_size) in test_cases {
-            let hmac = variant;
-            let key = "this is my key".as_bytes();
+        for (variant, expected) in test_cases {
+            let hmac = *variant;
+            let key = b"this is my key";
             let hash = hmac.with_key(key);
 
-            let tag1 = hash.sign_concat(
-                &[],
-                &[
-                    "fake it".as_bytes(),
-                    "till you".as_bytes(),
-                    "make".as_bytes(),
-                    "it".as_bytes(),
-                ],
-                &[],
+            let tag = hash.sign_concat(
+                b"fake it",
+                &[b"till you".as_ref(), b"make".as_ref()],
+                b"it",
             );
 
-            let tag2 = hash.sign_concat(
-                &[],
-                &[
-                    "fake it".as_bytes(),
-                    "till you".as_bytes(),
-                    "make".as_bytes(),
-                    "it".as_bytes(),
-                ],
-                &[],
+            assert_eq!(
+                tag.as_ref(),
+                *expected,
+                "HMAC-{} known-answer mismatch",
+                if matches!(variant, WCShaHmac::Sha256) { "SHA256" } else { "SHA384" }
             );
-
-            assert_eq!(tag1.as_ref(), tag2.as_ref());
-            assert_eq!(tag1.as_ref().len(), expected_size);
         }
     }
 }

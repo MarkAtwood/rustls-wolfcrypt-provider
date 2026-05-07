@@ -1,9 +1,8 @@
-use crate::{error::check_if_zero, types::*};
-use core::mem;
-use foreign_types::ForeignType;
+#![cfg(ed25519)]
+
 use rustls::pki_types::{AlgorithmIdentifier, InvalidSignature, SignatureVerificationAlgorithm};
 use rustls_pki_types::alg_id;
-use wolfcrypt_rs::*;
+use wolfssl_wolfcrypt::ed25519::Ed25519 as WcEd25519;
 
 #[derive(Debug)]
 pub struct Ed25519;
@@ -23,35 +22,11 @@ impl SignatureVerificationAlgorithm for Ed25519 {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), InvalidSignature> {
-        unsafe {
-            let mut ed25519_c_type: ed25519_key = mem::zeroed();
-            let ed25519_key_object = ED25519KeyObject::from_ptr(&mut ed25519_c_type);
-            let mut stat: i32 = 0;
-
-            ed25519_key_object.init();
-
-            let mut ret = wc_ed25519_import_public(
-                public_key.as_ptr(),
-                public_key.len() as word32,
-                ed25519_key_object.as_ptr(),
-            );
-            check_if_zero(ret).map_err(|_| InvalidSignature)?;
-
-            ret = wc_ed25519_verify_msg(
-                signature.as_ptr(),
-                signature.len() as word32,
-                message.as_ptr(),
-                message.len() as word32,
-                &mut stat,
-                ed25519_key_object.as_ptr(),
-            );
-
-            check_if_zero(ret).map_err(|_| InvalidSignature)?;
-            if stat == 1 {
-                Ok(())
-            } else {
-                Err(InvalidSignature)
-            }
+        let mut ed = WcEd25519::new().map_err(|_| InvalidSignature)?;
+        ed.import_public(public_key).map_err(|_| InvalidSignature)?;
+        match ed.verify_msg(signature, message) {
+            Ok(true) => Ok(()),
+            _ => Err(InvalidSignature),
         }
     }
 }

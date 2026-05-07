@@ -1,29 +1,16 @@
 use alloc::boxed::Box;
-use core::mem;
-use foreign_types::ForeignType;
 use rustls::crypto::hash;
-use wolfcrypt_rs::*;
-
-use crate::error::check_if_zero;
-use crate::types::*;
+use wolfssl_wolfcrypt::sha::SHA384;
 
 pub struct WCSha384;
 
 impl hash::Hash for WCSha384 {
     fn start(&self) -> Box<dyn hash::Context> {
-        let mut sha384_storage = Box::new(unsafe { mem::zeroed::<wc_Sha384>() });
-        let sha384_object = unsafe { Sha384Object::from_ptr(&mut *sha384_storage) };
-        let hash: [u8; WC_SHA384_DIGEST_SIZE as usize] = [0; WC_SHA384_DIGEST_SIZE as usize];
-
-        let mut hasher = WCHasher384 {
-            sha384_object,
-            _sha384_storage: sha384_storage,
-            hash,
-        };
-
-        hasher.wchasher_init();
-
-        Box::new(WCSha384Context(hasher))
+        // SHA384::new() can only fail on allocation failure; the rustls
+        // hash::Hash::start() method returns Box<dyn Context> — no Result.
+        let sha = SHA384::new()
+            .unwrap_or_else(|e| panic!("SHA384::new failed: wolfSSL error {}", e));
+        Box::new(WCSha384Context { sha })
     }
 
     fn hash(&self, data: &[u8]) -> hash::Output {
@@ -37,61 +24,59 @@ impl hash::Hash for WCSha384 {
     }
 
     fn output_len(&self) -> usize {
-        WC_SHA384_DIGEST_SIZE as usize
+        SHA384::DIGEST_SIZE
     }
 }
 
-struct WCHasher384 {
-    sha384_object: Sha384Object,
-    _sha384_storage: Box<wc_Sha384>,
-    hash: [u8; WC_SHA384_DIGEST_SIZE as usize],
+struct WCSha384Context {
+    sha: SHA384,
 }
-
-impl WCHasher384 {
-    fn wchasher_init(&mut self) {
-        // This function initializes SHA384. This is automatically called by wc_Sha384Hash.
-        let ret = unsafe { wc_InitSha384(self.sha384_object.as_ptr()) };
-        check_if_zero(ret).expect("wc_InitSha384 failed");
-    }
-
-    fn wchasher_update(&mut self, data: &[u8]) {
-        let length: word32 = data.len() as word32;
-
-        // Hash the provided byte array of length len.
-        // Can be called continually.
-        let ret = unsafe { wc_Sha384Update(self.sha384_object.as_ptr(), data.as_ptr(), length) };
-        check_if_zero(ret).expect("wc_Sha384Update failed");
-    }
-
-    fn wchasher_final(&mut self) -> &[u8] {
-        // Finalizes hashing of data. Result is placed into hash.
-        // Resets state of the sha384 struct.
-        let ret = unsafe { wc_Sha384Final(self.sha384_object.as_ptr(), self.hash.as_mut_ptr()) };
-        check_if_zero(ret).expect("wc_Sha384Final failed");
-
-        &self.hash
-    }
-}
-
-struct WCSha384Context(WCHasher384);
 
 impl hash::Context for WCSha384Context {
     fn fork_finish(&self) -> hash::Output {
-        hash::Output::new(self.0.clone().wchasher_final())
+        self.fork().finish()
     }
 
     fn fork(&self) -> Box<dyn hash::Context> {
-        Box::new(WCSha384Context(self.0.clone()))
+        // wc_Sha384Copy clones the internal wolfSSL SHA-384 state in O(1),
+        // avoiding O(N) data-replay of all bytes fed so far.
+        // SHA384::copy() clones the hash state in O(1); failure means OOM or
+        // state corruption — both abort-level in a no-Result trait method.
+        let sha = self.sha
+            .copy()
+            .unwrap_or_else(|e| panic!("SHA384::copy failed: wolfSSL error {}", e));
+        Box::new(WCSha384Context { sha })
     }
 
     fn finish(mut self: Box<Self>) -> hash::Output {
-        hash::Output::new(self.0.wchasher_final())
+        let mut hash = [0u8; SHA384::DIGEST_SIZE];
+        self.sha
+            .finalize(&mut hash)
+            .unwrap_or_else(|e| panic!("SHA384::finalize failed: wolfSSL error {}", e));
+        hash::Output::new(&hash)
     }
 
     fn update(&mut self, data: &[u8]) {
-        self.0.wchasher_update(data);
+        self.sha
+            .update(data)
+            .unwrap_or_else(|e| panic!("SHA384::update failed: wolfSSL error {}", e));
     }
 }
+
+// SAFETY: WCSha384Context is exclusively owned — rustls::crypto::hash::Context
+// is consumed (Box<Self>) on finish() and moved into fork().  No caller holds
+// simultaneous references, so there is no aliasing across threads.  The Sync
+// impl satisfies trait-object bounds; the Send impl allows Box<dyn Context>
+// to be moved across threads, which is the only cross-thread transfer path.
+// wc_Sha384 itself is not internally synchronized, so callers must not share
+// a WCSha384Context between threads — the exclusive-ownership invariant above
+// ensures this is never the case.
+// Note: Sync is only safe here because the rustls hash::Context API exposes
+// only Box<dyn Context> ownership and does not implement Clone; no Arc-based
+// sharing path exists, so concurrent fork() calls on the same instance are
+// unreachable through the public API.
+unsafe impl Sync for WCSha384Context {}
+unsafe impl Send for WCSha384Context {}
 
 #[cfg(test)]
 mod tests {
@@ -109,22 +94,35 @@ mod tests {
 
         assert_eq!(hash_str1, hash_str2);
     }
-}
 
-unsafe impl Sync for WCHasher384 {}
-unsafe impl Send for WCHasher384 {}
-impl Clone for WCHasher384 {
-    fn clone(&self) -> WCHasher384 {
-        let mut new_storage = Box::new(unsafe { mem::zeroed::<wc_Sha384>() });
-        let new_object = unsafe { Sha384Object::from_ptr(&mut *new_storage) };
-        let ret = unsafe { wc_InitSha384(new_object.as_ptr()) };
-        check_if_zero(ret).expect("wc_InitSha384 failed in clone");
-        let ret = unsafe { wc_Sha384Copy(self.sha384_object.as_ptr(), new_object.as_ptr()) };
-        check_if_zero(ret).expect("wc_Sha384Copy failed");
-        WCHasher384 {
-            sha384_object: new_object,
-            _sha384_storage: new_storage,
-            hash: self.hash,
-        }
+    #[test]
+    fn test_sha384_known_answer() {
+        // Cross-validated with openssl: echo -n "abc" | openssl sha384
+        let wcsha384 = WCSha384;
+        let hash = wcsha384.hash(b"abc");
+        let expected = hex::decode(
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed\
+             8086072ba1e7cc2358baeca134c825a7",
+        )
+        .unwrap();
+        assert_eq!(hash.as_ref(), expected.as_slice(), "SHA-384('abc') mismatch");
+    }
+
+    #[test]
+    fn test_sha384_fork() {
+        let wcsha384 = WCSha384;
+        let mut ctx = wcsha384.start();
+        ctx.update(b"hello ");
+
+        let forked = ctx.fork();
+        ctx.update(b"world");
+        let forked_finish = {
+            let mut f = forked;
+            f.update(b"world");
+            f.finish()
+        };
+        let orig_finish = ctx.finish();
+
+        assert_eq!(hex::encode(orig_finish), hex::encode(forked_finish));
     }
 }

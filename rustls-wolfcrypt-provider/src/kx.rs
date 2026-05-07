@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use crypto::SupportedKxGroup;
 use rustls::crypto;
 
+pub(crate) mod ecc_kx;
 mod sec256r1;
 mod sec384r1;
 mod sec521r1;
@@ -10,7 +11,7 @@ mod x25519;
 pub const ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[&X25519, &SecP256R1, &SecP384R1, &SecP521R1];
 
 macro_rules! define_kx_group {
-    ($name:ident, $kx_type:ty, $kx_func:ident, $named_group:expr) => {
+    ($name:ident, $kx_type:ty, $kx_func:ident, $named_group:expr $(,)?) => {
         #[derive(Debug)]
         pub struct $name;
 

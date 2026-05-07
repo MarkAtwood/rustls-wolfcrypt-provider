@@ -22,10 +22,12 @@ use crate::prf::WCPrfUsingHmac;
 pub mod aead {
     pub mod aes128gcm;
     pub mod aes256gcm;
+    pub(crate) mod aesgcm;
     pub mod chacha20;
 }
 pub mod sign {
     pub mod ecdsa;
+    #[cfg(ed25519)]
     pub mod eddsa;
     pub mod rsa;
 }
@@ -40,8 +42,6 @@ use crate::hash::{sha256, sha384};
 pub mod hmac;
 
 use crate::hmac::WCShaHmac;
-
-pub mod types;
 
 type SigningKeyResult = Result<Arc<dyn rustls::sign::SigningKey>, rustls::Error>;
 type SigningKeyFn = dyn Fn(&PrivateKeyDer<'static>) -> SigningKeyResult;
@@ -60,11 +60,9 @@ pub fn provider() -> CryptoProvider {
     }
 }
 
-pub fn provider_with_specified_ciphers(
-    ciphers: Vec<rustls::SupportedCipherSuite>,
-) -> CryptoProvider {
+pub fn provider_with_specified_ciphers(ciphers: &[rustls::SupportedCipherSuite]) -> CryptoProvider {
     CryptoProvider {
-        cipher_suites: ciphers,
+        cipher_suites: ciphers.to_vec(),
         kx_groups: kx::ALL_KX_GROUPS.to_vec(),
         signature_verification_algorithms: verify::ALGORITHMS,
         secure_random: &Provider,
@@ -77,10 +75,8 @@ struct Provider;
 
 impl rustls::crypto::SecureRandom for Provider {
     fn fill(&self, bytes: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
-        match random::wolfcrypt_random_buffer_generator(bytes) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(rustls::crypto::GetRandomFailed),
-        }
+        random::wolfcrypt_random_buffer_generator(bytes)
+            .map_err(|_| rustls::crypto::GetRandomFailed)
     }
 }
 
@@ -93,19 +89,30 @@ impl rustls::crypto::KeyProvider for Provider {
         let algorithms: SigningAlgorithms = vec![
             Box::new(|key| sign::ecdsa::EcdsaSigningKey::try_from(key).map(|x| Arc::new(x) as _)),
             Box::new(|key| sign::rsa::RsaPrivateKey::try_from(key).map(|x| Arc::new(x) as _)),
+            #[cfg(ed25519)]
             Box::new(|key| sign::eddsa::Ed25519PrivateKey::try_from(key).map(|x| Arc::new(x) as _)),
         ];
 
+        let mut first_err: Option<rustls::Error> = None;
         for algorithm in algorithms {
             match algorithm(&key_der) {
-                Ok(signing_key) => return Ok(signing_key), // Return the key if the algorithm succeeds
-                Err(_) => continue, // Ignore the error and move to the next algorithm
+                Ok(signing_key) => return Ok(signing_key),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
             }
         }
 
-        // If no algorithm succeeded, return an error
+        // Report the first per-algorithm error to aid debugging key format issues.
+        let reason = match first_err {
+            Some(rustls::Error::General(msg)) => msg,
+            Some(e) => alloc::format!("{e}"),
+            None => "no algorithms tried".into(),
+        };
         Err(rustls::Error::General(
-            "Unsupported private key format".into(),
+            alloc::format!("Unsupported private key format: {reason}"),
         ))
     }
 }
@@ -131,10 +138,11 @@ static ALL_RSA_SCHEMES: &[rustls::SignatureScheme] = &[
     rustls::SignatureScheme::RSA_PKCS1_SHA512,
 ];
 
-static ALL_ECDSA_SCHEMES: &[rustls::SignatureScheme] = &[
+static ALL_EC_SCHEMES: &[rustls::SignatureScheme] = &[
     rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
     rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
     rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+    #[cfg(ed25519)]
     rustls::SignatureScheme::ED25519,
 ];
 
@@ -222,7 +230,7 @@ pub static TLS12_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: rustls::SupportedCip
         },
         prf_provider: &WCPrfUsingHmac(WCShaHmac::Sha256),
         kx: rustls::crypto::KeyExchangeAlgorithm::ECDHE,
-        sign: ALL_ECDSA_SCHEMES,
+        sign: ALL_EC_SCHEMES,
         aead_alg: &chacha20::Chacha20Poly1305,
     });
 
@@ -236,7 +244,7 @@ pub static TLS12_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: rustls::SupportedCipherSui
         aead_alg: &aes128gcm::Aes128Gcm,
         prf_provider: &WCPrfUsingHmac(WCShaHmac::Sha256),
         kx: rustls::crypto::KeyExchangeAlgorithm::ECDHE,
-        sign: ALL_ECDSA_SCHEMES,
+        sign: ALL_EC_SCHEMES,
     });
 
 pub static TLS12_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: rustls::SupportedCipherSuite =
@@ -249,5 +257,5 @@ pub static TLS12_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: rustls::SupportedCipherSui
         aead_alg: &aes256gcm::Aes256Gcm,
         prf_provider: &WCPrfUsingHmac(WCShaHmac::Sha384),
         kx: rustls::crypto::KeyExchangeAlgorithm::ECDHE,
-        sign: ALL_ECDSA_SCHEMES,
+        sign: ALL_EC_SCHEMES,
     });

@@ -1,27 +1,23 @@
-use foreign_types::ForeignType;
 use lazy_static::lazy_static;
 use rayon::prelude::*;
 use rustls::version::{TLS12, TLS13};
 use rustls::SignatureScheme;
-use rustls_wolfcrypt_provider::error::*;
-use rustls_wolfcrypt_provider::types::*;
 use rustls_wolfcrypt_provider::{
-    TLS12_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS12_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-    TLS12_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, TLS13_AES_128_GCM_SHA256,
-    TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+    TLS12_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS12_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    TLS12_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS12_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    TLS12_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS12_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
 };
 use std::env;
 use std::fs::File;
 use std::io::stdout;
 use std::io::BufReader;
 use std::io::{Read, Write};
-use std::mem;
 use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::sync::Once;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use wolfcrypt_rs::*;
 
 /*
  * Version config used by the server to specify
@@ -57,27 +53,57 @@ fn init_thread_pool() {
 
 /*
  * Starts background job for wolfssl server (localhost:4443).
+ *
+ * The wolfssl server binary location is resolved from the WOLFSSL_SRC_DIR
+ * environment variable (path to a wolfssl source tree with a built server
+ * binary at examples/server/server).  Falls back to ~/GIT/wolfssl.
+ * The working directory is NOT changed — absolute paths are used throughout
+ * so that concurrent tests that share the process are not affected.
  * */
-fn start_wolfssl_server(current_dir_string: String, tls_version: &str) -> Child {
-    if let Err(e) = env::set_current_dir("../wolfcrypt-rs/wolfssl-5.7.6-stable/") {
-        panic!("Error changing directory: {}", e);
-    } else {
-        println!("Changed directory to wolfssl-5.7.6-stable.");
+fn wolfssl_server_bin() -> String {
+    let wolfssl_src = env::var("WOLFSSL_SRC_DIR").unwrap_or_else(|_| {
+        let home = env::var("HOME").expect("HOME not set");
+        format!("{}/GIT/wolfssl", home)
+    });
+    format!("{}/examples/server/server", wolfssl_src)
+}
 
-        Command::new("./examples/server/server")
-            .arg("-d")
-            .arg("-c")
-            .arg(current_dir_string.clone() + "/tests/certs/localhost.pem")
-            .arg("-k")
-            .arg(current_dir_string.clone() + "/tests/certs/localhost.key")
-            .arg("-p")
-            .arg("4443")
-            .arg(tls_version)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("Failed to start wolfssl server.")
-    }
+fn wolfssl_src_dir() -> String {
+    env::var("WOLFSSL_SRC_DIR").unwrap_or_else(|_| {
+        let home = env::var("HOME").expect("HOME not set");
+        format!("{}/GIT/wolfssl", home)
+    })
+}
+
+fn start_wolfssl_server(current_dir_string: String, tls_version: &str) -> Child {
+    start_wolfssl_server_with_certs(
+        current_dir_string.clone() + "/tests/certs/localhost.pem",
+        current_dir_string.clone() + "/tests/certs/localhost.key",
+        tls_version,
+    )
+}
+
+/// Start a wolfssl server with explicit cert and key paths.
+fn start_wolfssl_server_with_certs(cert: String, key: String, tls_version: &str) -> Child {
+    let server_bin = wolfssl_server_bin();
+    let wolfssl_src = wolfssl_src_dir();
+
+    Command::new(&server_bin)
+        // Run from the wolfssl source directory so the server binary can find
+        // its own certs/ directory (used for internal initialisation checks).
+        .current_dir(&wolfssl_src)
+        .arg("-d")
+        .arg("-c")
+        .arg(&cert)
+        .arg("-k")
+        .arg(&key)
+        .arg("-p")
+        .arg("4443")
+        .arg(tls_version)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("Failed to start wolfssl server at {}: {}", server_bin, e))
 }
 
 #[cfg(test)]
@@ -131,8 +157,7 @@ mod tests {
             root_store.add_parsable_certificates(certs);
 
             let config = rustls::ClientConfig::builder_with_provider(
-                rustls_wolfcrypt_provider::provider_with_specified_ciphers([cipher].to_vec())
-                    .into(),
+                rustls_wolfcrypt_provider::provider_with_specified_ciphers(&[cipher]).into(),
             )
             .with_protocol_versions(&[&TLS12])
             .unwrap()
@@ -176,7 +201,93 @@ mod tests {
                 stdout().write_all(b"\n").unwrap();
             }
 
-            let _ = env::set_current_dir(current_dir_string.clone());
+            drop(server_thread);
+        }
+    }
+
+    /// Tests all three TLS 1.2 ECDHE-ECDSA cipher suites against a wolfssl server
+    /// configured with a P-256 ECDSA certificate.  This exercises the full
+    /// ECDSA sign/verify path through the rustls provider trait interface.
+    #[test]
+    fn test_tls12_ecdsa_against_server() {
+        let _guard = SERVER_LOCK.lock().unwrap();
+        let current_dir = env::current_dir().unwrap();
+        let current_dir_string = current_dir.to_string_lossy().into_owned();
+
+        let ciphers = [
+            TLS12_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            TLS12_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            TLS12_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        ];
+
+        for cipher in ciphers {
+            let cert = current_dir_string.clone() + "/tests/certs/localhost-ecc.pem";
+            let key = current_dir_string.clone() + "/tests/certs/localhost-ecc.key";
+            let server_thread = {
+                let wolfssl_server =
+                    Arc::new(Mutex::new(start_wolfssl_server_with_certs(cert, key, TLSV1_2)));
+                thread::spawn(move || {
+                    wolfssl_server
+                        .lock()
+                        .unwrap()
+                        .wait()
+                        .expect("wolfssl server stopped unexpectedly");
+                })
+            };
+
+            // Wait for the server to start.
+            thread::sleep(std::time::Duration::from_secs(1));
+
+            let mut root_store = rustls::RootCertStore::empty();
+            let ca_certs = rustls_pemfile::certs(&mut BufReader::new(
+                &mut File::open(current_dir_string.clone() + "/tests/certs/EccRootCA.pem")
+                    .unwrap(),
+            ))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+            root_store.add_parsable_certificates(ca_certs);
+
+            let config = rustls::ClientConfig::builder_with_provider(
+                rustls_wolfcrypt_provider::provider_with_specified_ciphers(&[cipher]).into(),
+            )
+            .with_protocol_versions(&[&TLS12])
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+            let server_name = "localhost".try_into().unwrap();
+            let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
+            let mut sock = TcpStream::connect("localhost:4443").unwrap();
+            let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+
+            tls.write_all(
+                concat!(
+                    "GET / HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Connection: close\r\n",
+                    "Accept-Encoding: identity\r\n",
+                    "\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+            let ciphersuite = tls.conn.negotiated_cipher_suite().unwrap();
+            writeln!(
+                &mut std::io::stderr(),
+                "Current ciphersuite: {:?}",
+                ciphersuite.suite()
+            )
+            .unwrap();
+
+            let mut plaintext = Vec::new();
+            tls.read_to_end(&mut plaintext).unwrap();
+
+            let plaintext_str = String::from_utf8_lossy(&plaintext);
+            if let Some(first_line) = plaintext_str.lines().next() {
+                stdout().write_all(first_line.as_bytes()).unwrap();
+                stdout().write_all(b"\n").unwrap();
+            }
 
             drop(server_thread);
         }
@@ -224,8 +335,7 @@ mod tests {
             root_store.add_parsable_certificates(certs);
 
             let config = rustls::ClientConfig::builder_with_provider(
-                rustls_wolfcrypt_provider::provider_with_specified_ciphers([cipher].to_vec())
-                    .into(),
+                rustls_wolfcrypt_provider::provider_with_specified_ciphers(&[cipher]).into(),
             )
             .with_protocol_versions(&[&TLS13])
             .unwrap()
@@ -269,14 +379,12 @@ mod tests {
                 stdout().write_all(b"\n").unwrap();
             }
 
-            let _ = env::set_current_dir(current_dir_string.clone());
-
             drop(server_thread);
         }
     }
 
     #[test]
-    fn test_tl12_against_website() {
+    fn test_tls12_against_website() {
         let ciphers = [
             TLS12_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
             TLS12_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -288,8 +396,7 @@ mod tests {
                 rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
             let config = rustls::ClientConfig::builder_with_provider(
-                rustls_wolfcrypt_provider::provider_with_specified_ciphers([cipher].to_vec())
-                    .into(),
+                rustls_wolfcrypt_provider::provider_with_specified_ciphers(&[cipher]).into(),
             )
             .with_protocol_versions(&[&TLS12])
             .unwrap()
@@ -336,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tl13_against_website() {
+    fn test_tls13_against_website() {
         let ciphers = [
             TLS13_CHACHA20_POLY1305_SHA256,
             TLS13_AES_128_GCM_SHA256,
@@ -348,8 +455,7 @@ mod tests {
                 rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
             let config = rustls::ClientConfig::builder_with_provider(
-                rustls_wolfcrypt_provider::provider_with_specified_ciphers([cipher].to_vec())
-                    .into(),
+                rustls_wolfcrypt_provider::provider_with_specified_ciphers(&[cipher]).into(),
             )
             .with_protocol_versions(&[&TLS13])
             .unwrap()
@@ -395,176 +501,152 @@ mod tests {
         }
     }
 
-    pub struct ECCPubKey {
-        qx: Vec<u8>,
-        qx_len: word32,
-        qy: Vec<u8>,
-        qy_len: word32,
-    }
-
     #[test]
     fn ecdsa_sign_and_verify() {
+        use der::{asn1::ObjectIdentifier, Encode};
+        use sec1::{EcParameters, EcPrivateKey};
+        use wolfssl_wolfcrypt::{ecc::ECC, random::RNG};
+
         let wolfcrypt_default_provider = rustls_wolfcrypt_provider::provider();
 
-        // Define schemes, curve IDs, and key sizes as tuples
+        // OIDs for the three named curves (from RFC 5480)
+        const OID_P256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+        const OID_P384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
+        const OID_P521: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
+
+        // (scheme, wolfSSL curve ID, field byte length, curve OID)
         let test_configs = [
             (
                 SignatureScheme::ECDSA_NISTP256_SHA256,
-                ecc_curve_id_ECC_SECP256R1,
-                32, // P256 key size
+                ECC::SECP256R1,
+                32usize,
+                OID_P256,
             ),
             (
                 SignatureScheme::ECDSA_NISTP384_SHA384,
-                ecc_curve_id_ECC_SECP384R1,
-                48, // P384 key size
+                ECC::SECP384R1,
+                48usize,
+                OID_P384,
             ),
             (
                 SignatureScheme::ECDSA_NISTP521_SHA512,
-                ecc_curve_id_ECC_SECP521R1,
-                66, // P521 key size
+                ECC::SECP521R1,
+                66usize,
+                OID_P521,
             ),
         ];
 
-        for &(scheme, curve_id, key_size) in &test_configs {
-            let mut der_ecc_key: Vec<u8> = vec![0; 200]; // Adjust size if needed
-                                                         // Initialize RNG and ECC key objects
-            let mut rng: WC_RNG = unsafe { mem::zeroed() };
-            let rng_object: WCRngObject = WCRngObject::new(&mut rng);
-            rng_object.init();
-            let mut ecc_key_c_type: ecc_key = unsafe { mem::zeroed() };
-            let key_object = ECCKeyObject::new(&mut ecc_key_c_type);
-            key_object.init();
+        for (scheme, curve_id, key_size, curve_oid) in test_configs {
+            let mut rng = RNG::new().expect("RNG::new failed");
 
-            let mut pub_key_raw = ECCPubKey {
-                qx: vec![0; key_size],
-                qx_len: key_size as u32,
-                qy: vec![0; key_size],
-                qy_len: key_size as u32,
+            // Generate ECC key pair via the wolfssl-wolfcrypt safe wrapper.
+            let mut ecc = ECC::generate_ex(key_size as i32, &mut rng, curve_id, None, None)
+                .expect("ECC::generate_ex failed");
+
+            // Export the raw private scalar d (big-endian, zero-padded to key_size).
+            let mut priv_scalar = vec![0u8; key_size];
+            let priv_len = ecc
+                .export_private(&mut priv_scalar)
+                .expect("ECC::export_private failed");
+            let priv_scalar = &priv_scalar[..priv_len];
+
+            // Export the uncompressed public point: 04 || Qx || Qy.
+            // The maximum X9.63 uncompressed encoding is 1 + 2*key_size bytes.
+            let mut pub_x963 = vec![0u8; 1 + 2 * key_size];
+            let pub_len = ecc
+                .export_x963(&mut pub_x963)
+                .expect("ECC::export_x963 failed");
+            let pub_x963 = &pub_x963[..pub_len];
+
+            // Build a SEC1 ECPrivateKey DER structure:
+            //   SEQUENCE {
+            //     INTEGER 1,
+            //     OCTET STRING (privkey),
+            //     [0] EXPLICIT OID (namedCurve),
+            //     [1] EXPLICIT BIT STRING (pubkey)
+            //   }
+            // Both PrivatePkcs8KeyDer and PrivateSec1KeyDer accept this SEC1 encoding —
+            // the provider's key loader auto-detects the encapsulation format.
+            let ec_private_key = EcPrivateKey {
+                private_key: priv_scalar,
+                parameters: Some(EcParameters::NamedCurve(curve_oid)),
+                public_key: Some(pub_x963),
             };
+            let der_ecc_key = ec_private_key
+                .to_der()
+                .expect("EcPrivateKey::to_der failed");
 
-            // Generate ECC key
-            let ret = unsafe {
-                wc_ecc_make_key_ex(
-                    rng_object.as_ptr(),
-                    key_size as i32,
-                    key_object.as_ptr(),
-                    curve_id,
-                )
-            };
-            check_if_zero(ret).unwrap();
-
-            // Export public key
-            let ret = unsafe {
-                wc_ecc_export_public_raw(
-                    key_object.as_ptr(),
-                    pub_key_raw.qx.as_mut_ptr(),
-                    &mut pub_key_raw.qx_len,
-                    pub_key_raw.qy.as_mut_ptr(),
-                    &mut pub_key_raw.qy_len,
-                )
-            };
-            check_if_zero(ret).unwrap();
-
-            let mut pub_key_bytes = Vec::new();
-            pub_key_bytes.push(0x04); // Uncompressed point indicator
-            pub_key_bytes.extend_from_slice(&pub_key_raw.qx.clone());
-            pub_key_bytes.extend_from_slice(&pub_key_raw.qy.clone());
-
-            // Export private key in DER format
-            let ret = unsafe {
-                wc_EccPrivateKeyToDer(
-                    key_object.as_ptr(),
-                    der_ecc_key.as_mut_ptr(),
-                    der_ecc_key.len() as word32,
-                )
-            };
-            check_if_greater_than_zero(ret).unwrap();
-
-            // Trim to actual key size
-            der_ecc_key.resize(ret as usize, 0);
-
-            // Convert to PKCS#8 format and verify
+            // Verify with PKCS#8 key container.
             let rustls_private_key_pkcs8 =
                 PrivateKeyDer::from(PrivatePkcs8KeyDer::from(der_ecc_key.as_slice()));
-
             sign_and_verify(
                 &wolfcrypt_default_provider,
                 scheme,
                 rustls_private_key_pkcs8.clone_key(),
-                pub_key_bytes.as_slice(),
+                pub_x963,
             );
 
-            // Convert to SEC1 format and verify
+            // Verify with SEC1 key container.
             let rustls_private_key_sec1 =
                 PrivateKeyDer::from(PrivateSec1KeyDer::from(der_ecc_key.as_slice()));
-
             sign_and_verify(
                 &wolfcrypt_default_provider,
                 scheme,
                 rustls_private_key_sec1.clone_key(),
-                pub_key_bytes.as_slice(),
+                pub_x963,
             );
         }
     }
 
     #[test]
     fn eddsa_sign_and_verify() {
+        use der::{
+            asn1::{ObjectIdentifier, OctetString},
+            Encode,
+        };
+        use pkcs8::{AlgorithmIdentifierRef, PrivateKeyInfo};
+        use wolfssl_wolfcrypt::{ed25519::Ed25519, random::RNG};
+
         let wolfcrypt_default_provider = rustls_wolfcrypt_provider::provider();
 
-        // Initialize RNG and ECC key objects
-        let mut rng: WC_RNG = unsafe { mem::zeroed() };
-        let rng_object: WCRngObject = WCRngObject::new(&mut rng);
-        rng_object.init();
+        let mut rng = RNG::new().expect("RNG::new failed");
 
-        let mut key_c_type: ed25519_key = unsafe { mem::zeroed() };
-        let key_object = ED25519KeyObject::new(&mut key_c_type);
-        key_object.init();
+        // Generate Ed25519 key pair via the wolfssl-wolfcrypt safe wrapper.
+        let ed = Ed25519::generate(&mut rng).expect("Ed25519::generate failed");
 
-        let mut der_ed25519_key: Vec<u8> = vec![0; 200]; // Adjust size if needed
-        let mut pub_key_raw: [u8; 32] = [0; 32];
-        let mut pub_key_raw_len: word32 = pub_key_raw.len() as word32;
-        let mut priv_key_raw: [u8; 32] = [0; 32];
-        let mut priv_key_bytes_len: word32 = priv_key_raw.len() as word32;
+        // Export the 32-byte private seed.
+        let mut priv_seed = [0u8; 32];
+        ed.export_private_only(&mut priv_seed)
+            .expect("Ed25519::export_private_only failed");
 
-        let mut ret;
+        // Export the 32-byte public key.
+        let mut pub_key_raw = [0u8; 32];
+        ed.export_public(&mut pub_key_raw)
+            .expect("Ed25519::export_public failed");
 
-        // Generate ECC key
-        ret = unsafe { wc_ed25519_make_key(rng_object.as_ptr(), 32, key_object.as_ptr()) };
-        check_if_zero(ret).unwrap();
-
-        // Export private key
-        ret = unsafe {
-            wc_ed25519_export_private_only(
-                key_object.as_ptr(),
-                priv_key_raw.as_mut_ptr(),
-                &mut priv_key_bytes_len,
-            )
+        // Build PKCS#8 PrivateKeyInfo DER for Ed25519 (RFC 8410).
+        // AlgorithmIdentifier: { OID 1.3.101.112, no parameters }
+        // privateKey: OCTET STRING { OCTET STRING(seed) }   (double-wrapped per RFC 8410 §7)
+        let ed25519_oid = ObjectIdentifier::new_unwrap("1.3.101.112");
+        let algorithm = AlgorithmIdentifierRef {
+            oid: ed25519_oid,
+            parameters: None,
         };
-        check_if_zero(ret).unwrap();
-
-        // Export public key
-        ret = unsafe {
-            wc_ed25519_export_public(
-                key_object.as_ptr(),
-                pub_key_raw.as_mut_ptr(),
-                &mut pub_key_raw_len,
-            )
+        // The inner value is an OCTET STRING wrapping the raw seed bytes.
+        let inner_octet_string = OctetString::new(priv_seed.as_slice())
+            .expect("OctetString::new for Ed25519 seed failed");
+        let inner_der = inner_octet_string
+            .to_der()
+            .expect("OctetString::to_der for Ed25519 seed failed");
+        let pki = PrivateKeyInfo {
+            algorithm,
+            private_key: &inner_der,
+            public_key: None,
         };
-        check_if_zero(ret).unwrap();
+        let pkcs8_der = pki.to_der().expect("PrivateKeyInfo::to_der failed");
 
-        // Export private key in DER format
-        ret = unsafe {
-            wc_Ed25519PrivateKeyToDer(
-                key_object.as_ptr(),
-                der_ed25519_key.as_mut_ptr(),
-                der_ed25519_key.len() as word32,
-            )
-        };
-        check_if_greater_than_zero(ret).unwrap();
-
-        der_ed25519_key.resize(ret as usize, 0); // Trim to actual size
-        let rustls_pkcs8_der = PrivatePkcs8KeyDer::from(der_ed25519_key.as_slice());
-        let rustls_private_key = PrivateKeyDer::from(rustls_pkcs8_der);
+        let rustls_private_key =
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(pkcs8_der.as_slice()));
 
         sign_and_verify(
             &wolfcrypt_default_provider,
@@ -591,15 +673,13 @@ mod tests {
             .collect();
 
         test_cases.par_iter().for_each(|&(scheme, key_size)| {
-            generate_and_test_rsa_pkcs8_key(&wolfcrypt_default_provider, scheme, key_size).expect(
-                &format!("Failed for scheme {:?} with key size {}", scheme, key_size),
-            );
+            generate_and_test_rsa_pkcs8_key(&wolfcrypt_default_provider, scheme, key_size)
+                .unwrap_or_else(|e| panic!("Failed for scheme {:?} with key size {}: {}", scheme, key_size, e));
         });
 
         test_cases.par_iter().for_each(|&(scheme, key_size)| {
-            generate_and_test_rsa_pkcs1_key(&wolfcrypt_default_provider, scheme, key_size).expect(
-                &format!("Failed for scheme {:?} with key size {}", scheme, key_size),
-            );
+            generate_and_test_rsa_pkcs1_key(&wolfcrypt_default_provider, scheme, key_size)
+                .unwrap_or_else(|e| panic!("Failed for scheme {:?} with key size {}: {}", scheme, key_size, e));
         });
     }
 
@@ -608,58 +688,33 @@ mod tests {
         scheme: SignatureScheme,
         key_size: usize,
     ) -> Result<(), anyhow::Error> {
-        let mut rsa_key_c_type: RsaKey = unsafe { mem::zeroed() };
-        let rsa_key_object = unsafe { RsaKeyObject::from_ptr(&mut rsa_key_c_type) };
-        let mut priv_key_der: Vec<u8> = vec![0; 2392];
-        let mut pub_key_der: Vec<u8> = vec![0; 2392];
+        use pkcs8::EncodePrivateKey;
+        use pkcs8::EncodePublicKey;
+        use rand_core::OsRng;
+        use rsa::RsaPrivateKey;
 
-        let ret = unsafe { wc_InitRsaKey(rsa_key_object.as_ptr(), std::ptr::null_mut()) };
-        check_if_zero(ret).unwrap();
+        // Generate RSA key pair using the pure-Rust rsa crate (already a library dep).
+        // OsRng implements CryptoRngCore via rand_core's getrandom feature.
+        let priv_key = RsaPrivateKey::new(&mut OsRng, key_size).expect("RsaPrivateKey::new failed");
 
-        let mut rng_c_type: WC_RNG = unsafe { mem::zeroed() };
-        let rng_object = WCRngObject::new(&mut rng_c_type);
-        rng_object.init();
+        // PKCS#8-wrapped DER (AlgorithmIdentifier + PKCS#1 inner key).
+        let pkcs8_doc = priv_key
+            .to_pkcs8_der()
+            .expect("RsaPrivateKey::to_pkcs8_der failed");
+        let rustls_private_key =
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(pkcs8_doc.as_bytes()));
 
-        unsafe { wc_RsaSetRNG(rsa_key_object.as_ptr(), rng_object.as_ptr()) };
-
-        let ret = unsafe {
-            wc_MakeRsaKey(
-                rsa_key_object.as_ptr(),
-                key_size as i32,
-                WC_RSA_EXPONENT.into(),
-                rng_object.as_ptr(),
-            )
-        };
-        check_if_zero(ret).unwrap();
-
-        let ret = unsafe {
-            wc_RsaKeyToDer(
-                rsa_key_object.as_ptr(),
-                priv_key_der.as_mut_ptr(),
-                priv_key_der.len() as word32,
-            )
-        };
-        check_if_greater_than_zero(ret).unwrap();
-        priv_key_der.resize(ret as usize, 0);
-
-        let rustls_pkcs8_der = PrivatePkcs8KeyDer::from(priv_key_der.as_slice());
-        let rustls_private_key = PrivateKeyDer::from(rustls_pkcs8_der);
-
-        let ret = unsafe {
-            wc_RsaKeyToPublicDer(
-                rsa_key_object.as_ptr(),
-                pub_key_der.as_mut_ptr(),
-                pub_key_der.len() as word32,
-            )
-        };
-        check_if_greater_than_zero(ret).unwrap();
-        pub_key_der.resize(ret as usize, 0);
+        // SubjectPublicKeyInfo DER for the verifying side.
+        let pub_key = priv_key.to_public_key();
+        let pub_der = pub_key
+            .to_public_key_der()
+            .expect("RsaPublicKey::to_public_key_der failed");
 
         sign_and_verify(
             provider,
             scheme,
             rustls_private_key.clone_key(),
-            pub_key_der.as_slice(),
+            pub_der.as_bytes(),
         );
 
         Ok(())
@@ -680,15 +735,13 @@ mod tests {
         .collect();
 
         test_cases.par_iter().for_each(|&(scheme, key_size)| {
-            generate_and_test_rsa_pkcs1_key(&wolfcrypt_default_provider, scheme, key_size).expect(
-                &format!("Failed for scheme {:?} with key size {}", scheme, key_size),
-            );
+            generate_and_test_rsa_pkcs1_key(&wolfcrypt_default_provider, scheme, key_size)
+                .unwrap_or_else(|e| panic!("Failed for scheme {:?} with key size {}: {}", scheme, key_size, e));
         });
 
         test_cases.par_iter().for_each(|&(scheme, key_size)| {
-            generate_and_test_rsa_pkcs8_key(&wolfcrypt_default_provider, scheme, key_size).expect(
-                &format!("Failed for scheme {:?} with key size {}", scheme, key_size),
-            );
+            generate_and_test_rsa_pkcs8_key(&wolfcrypt_default_provider, scheme, key_size)
+                .unwrap_or_else(|e| panic!("Failed for scheme {:?} with key size {}: {}", scheme, key_size, e));
         });
     }
 
@@ -697,60 +750,34 @@ mod tests {
         scheme: SignatureScheme,
         key_size: usize,
     ) -> Result<(), anyhow::Error> {
-        let mut rsa_key_c_type: RsaKey = unsafe { mem::zeroed() };
-        let rsa_key_object = unsafe { RsaKeyObject::from_ptr(&mut rsa_key_c_type) };
-        let mut priv_key_der: Vec<u8> = vec![0; 2392];
-        let mut pub_key_der: Vec<u8> = vec![0; 2392];
+        use pkcs1::EncodeRsaPrivateKey;
+        use pkcs8::EncodePublicKey;
+        use rand_core::OsRng;
+        use rsa::RsaPrivateKey;
 
-        let mut ret;
+        // Generate RSA key pair using the pure-Rust rsa crate (already a library dep).
+        let priv_key = RsaPrivateKey::new(&mut OsRng, key_size).expect("RsaPrivateKey::new failed");
 
-        ret = unsafe { wc_InitRsaKey(rsa_key_object.as_ptr(), std::ptr::null_mut()) };
-        check_if_zero(ret).unwrap();
+        // Raw PKCS#1 RSAPrivateKey DER (unwrapped, no AlgorithmIdentifier header).
+        // The pkcs1::EncodeRsaPrivateKey blanket-impl extracts this from the PKCS#8
+        // encoding produced by pkcs8::EncodePrivateKey.
+        let pkcs1_doc = priv_key
+            .to_pkcs1_der()
+            .expect("RsaPrivateKey::to_pkcs1_der failed");
+        let rustls_private_key =
+            PrivateKeyDer::from(PrivatePkcs1KeyDer::from(pkcs1_doc.as_bytes()));
 
-        let mut rng_c_type: WC_RNG = unsafe { mem::zeroed() };
-        let rng_object = WCRngObject::new(&mut rng_c_type);
-        rng_object.init();
-
-        unsafe { wc_RsaSetRNG(rsa_key_object.as_ptr(), rng_object.as_ptr()) };
-
-        ret = unsafe {
-            wc_MakeRsaKey(
-                rsa_key_object.as_ptr(),
-                key_size as i32,
-                WC_RSA_EXPONENT.into(),
-                rng_object.as_ptr(),
-            )
-        };
-        check_if_zero(ret).unwrap();
-
-        ret = unsafe {
-            wc_RsaKeyToDer(
-                rsa_key_object.as_ptr(),
-                priv_key_der.as_mut_ptr(),
-                priv_key_der.len() as word32,
-            )
-        };
-        check_if_greater_than_zero(ret).unwrap();
-        priv_key_der.resize(ret as usize, 0);
-
-        let rustls_pkcs1_der = PrivatePkcs1KeyDer::from(priv_key_der.as_slice());
-        let rustls_private_key = PrivateKeyDer::from(rustls_pkcs1_der);
-
-        ret = unsafe {
-            wc_RsaKeyToPublicDer(
-                rsa_key_object.as_ptr(),
-                pub_key_der.as_mut_ptr(),
-                pub_key_der.len() as word32,
-            )
-        };
-        check_if_greater_than_zero(ret).unwrap();
-        pub_key_der.resize(ret as usize, 0);
+        // SubjectPublicKeyInfo DER for the verifying side.
+        let pub_key = priv_key.to_public_key();
+        let pub_der = pub_key
+            .to_public_key_der()
+            .expect("RsaPublicKey::to_public_key_der failed");
 
         sign_and_verify(
             provider,
             scheme,
             rustls_private_key.clone_key(),
-            &pub_key_der,
+            pub_der.as_bytes(),
         );
         Ok(())
     }

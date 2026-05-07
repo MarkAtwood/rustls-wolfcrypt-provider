@@ -1,3 +1,8 @@
 /rustls-wolfcrypt-provider/target
 /wolfcrypt-rs/target
 /wolfcrypt-rs/wolfssl-*/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

@@ -1,0 +1,14 @@
+# wolfssl-wolfcrypt (5.9.1) and wolfcrypt-rs (5.7.6) both link wolfssl as
+# static libraries. Allow multiple definitions so that wolfssl-wolfcrypt's
+# symbols (first in link order) take precedence over wolfcrypt-rs's symbols.
+# This is a transitional workaround until wolfcrypt-rs is replaced entirely.
+# FIXME: This causes ABI mismatches for struct-heavy code (kx/sec256r1.rs etc.)
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+# Point wolfssl-wolfcrypt's build script at the installed wolfssl built from
+# ~/GIT/wolfssl (v5.9.1-stable, configured with --enable-curve25519 and all
+# other flags needed by the provider). This overrides the in-tree fallback
+# (~/WORK/wolfssl/src/.libs) which lacks --enable-curve25519.
+[env]
+WOLFSSL_PREFIX = "/home/mark/GIT/wolfssl-install"
